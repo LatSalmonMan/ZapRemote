@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#000000" />
+  <title>TV Remote</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            remote: {
+              bg: '#0a0a0b',
+              surface: '#1c1c1e',
+              surface2: '#2c2c2e',
+              border: '#3a3a3c',
+              muted: '#8e8e93',
+              accent: '#0a84ff',
+            }
+          },
+          boxShadow: {
+            pad: 'inset 0 1px 0 rgba(255,255,255,0.06), 0 8px 32px rgba(0,0,0,0.45)',
+            btn: '0 2px 8px rgba(0,0,0,0.35)',
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    * { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+    html, body { height: 100%; overscroll-behavior: none; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif; }
+
+    .ripple {
+      position: absolute;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.18);
+      transform: scale(0);
+      animation: ripple 0.55s ease-out forwards;
+      pointer-events: none;
+    }
+    @keyframes ripple {
+      to { transform: scale(2.8); opacity: 0; }
+    }
+
+    .swipe-hint {
+      animation: fadeHint 1.2s ease-out forwards;
+    }
+    @keyframes fadeHint {
+      0% { opacity: 0; transform: translate(-50%, -50%) scale(0.8); }
+      20% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+      100% { opacity: 0; transform: translate(-50%, -50%) scale(1.1); }
+    }
+
+    .mode-panel { transition: opacity 0.28s ease, transform 0.28s ease; }
+    .mode-panel.hidden-mode {
+      opacity: 0;
+      pointer-events: none;
+      position: absolute;
+      inset: 0;
+      transform: scale(0.96);
+    }
+    .mode-panel.active-mode {
+      opacity: 1;
+      pointer-events: auto;
+      position: relative;
+      transform: scale(1);
+    }
+
+    .remote-btn:active:not(:disabled),
+    .remote-btn.pressed {
+      transform: scale(0.94);
+      background-color: #3a3a3c !important;
+    }
+
+    .dpad-btn:active:not(:disabled),
+    .dpad-btn.pressed {
+      transform: scale(0.9);
+      background-color: #48484a !important;
+    }
+
+    .tv-dropdown.open .tv-menu { opacity: 1; visibility: visible; transform: translateY(0); }
+    .tv-menu {
+      opacity: 0;
+      visibility: hidden;
+      transform: translateY(-6px);
+      transition: all 0.22s ease;
+    }
+
+    .status-pulse { animation: pulse 2s ease-in-out infinite; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.45; }
+    }
+  </style>
+</head>
+<body class="bg-remote-bg text-white min-h-full flex flex-col select-none">
+
+  <!-- Top Bar -->
+  <header class="px-4 pt-[max(12px,env(safe-area-inset-top))] pb-3 border-b border-white/5 bg-remote-bg/95 backdrop-blur-xl sticky top-0 z-30">
+    <div class="tv-dropdown relative" id="tvDropdown">
+      <button
+        type="button"
+        id="tvSelectorBtn"
+        class="w-full flex items-center gap-3 rounded-2xl bg-remote-surface px-4 py-3.5 shadow-pad active:bg-remote-surface2 transition-colors"
+        aria-haspopup="listbox"
+        aria-expanded="false"
+      >
+        <div class="flex items-center gap-2 min-w-0 flex-1">
+          <span id="statusDot" class="w-2.5 h-2.5 rounded-full bg-red-500 shrink-0"></span>
+          <div class="text-left min-w-0">
+            <p class="text-[11px] uppercase tracking-wider text-remote-muted font-medium" id="statusLabel">Disconnected</p>
+            <p class="text-[17px] font-semibold truncate" id="selectedTVName">Choose a TV</p>
+          </div>
+        </div>
+        <svg class="w-5 h-5 text-remote-muted shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M8 9l4 4 4-4" />
+        </svg>
+      </button>
+
+      <div
+        class="tv-menu absolute left-0 right-0 top-[calc(100%+8px)] z-40 rounded-2xl bg-remote-surface border border-white/8 shadow-2xl overflow-hidden"
+        role="listbox"
+        id="tvMenu"
+      >
+        <p class="px-4 pt-3 pb-1 text-xs text-remote-muted font-medium">Nearby TVs</p>
+        <ul id="tvList" class="py-1 max-h-52 overflow-y-auto"></ul>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Remote -->
+  <main class="flex-1 flex flex-col px-4 py-4 gap-4 min-h-0">
+
+    <!-- Mode Toggle -->
+    <div class="flex justify-center">
+      <div class="inline-flex p-1 rounded-full bg-remote-surface border border-white/6" role="tablist">
+        <button type="button" id="modeTouchpad" class="mode-tab px-5 py-2 rounded-full text-sm font-medium bg-white/12 text-white transition-all" role="tab" aria-selected="true">
+          Touchpad
+        </button>
+        <button type="button" id="modeDpad" class="mode-tab px-5 py-2 rounded-full text-sm font-medium text-remote-muted transition-all" role="tab" aria-selected="false">
+          Arrows
+        </button>
+      </div>
+    </div>
+
+    <!-- Control Area -->
+    <section class="relative flex-1 min-h-[280px] max-h-[42vh] mx-auto w-full max-w-md">
+      <!-- Touchpad -->
+      <div id="touchpadPanel" class="mode-panel active-mode h-full">
+        <div
+          id="touchpad"
+          class="relative h-full w-full rounded-3xl bg-remote-surface border border-white/6 shadow-pad overflow-hidden cursor-pointer"
+          aria-label="Touchpad — swipe to navigate, tap to select"
+        >
+          <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <p class="text-remote-muted/50 text-sm font-medium" id="touchpadHint">Swipe or tap</p>
+          </div>
+          <div id="rippleLayer" class="absolute inset-0 overflow-hidden pointer-events-none"></div>
+          <div id="swipeFeedback" class="absolute inset-0 pointer-events-none"></div>
+        </div>
+      </div>
+
+      <!-- D-Pad -->
+      <div id="dpadPanel" class="mode-panel hidden-mode h-full flex items-center justify-center">
+        <div class="relative w-[min(100%,280px)] aspect-square">
+          <div class="absolute inset-0 rounded-full bg-remote-surface border border-white/6 shadow-pad"></div>
+          <div class="absolute inset-0 flex flex-col items-center justify-center gap-3 p-8">
+            <button type="button" class="dpad-btn w-[72px] h-[72px] rounded-full bg-remote-surface2 flex items-center justify-center transition-transform" data-action="up" aria-label="Up">
+              <svg class="w-7 h-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M5 15l7-7 7 7"/></svg>
+            </button>
+            <div class="flex items-center gap-3">
+              <button type="button" class="dpad-btn w-[72px] h-[72px] rounded-full bg-remote-surface2 flex items-center justify-center transition-transform" data-action="left" aria-label="Left">
+                <svg class="w-7 h-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg>
+              </button>
+              <button type="button" class="dpad-btn w-[76px] h-[76px] rounded-full bg-white/14 flex items-center justify-center transition-transform ring-1 ring-white/10" data-action="select" aria-label="OK">
+                <span class="text-sm font-semibold text-white/90">OK</span>
+              </button>
+              <button type="button" class="dpad-btn w-[72px] h-[72px] rounded-full bg-remote-surface2 flex items-center justify-center transition-transform" data-action="right" aria-label="Right">
+                <svg class="w-7 h-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
+              </button>
+            </div>
+            <button type="button" class="dpad-btn w-[72px] h-[72px] rounded-full bg-remote-surface2 flex items-center justify-center transition-transform" data-action="down" aria-label="Down">
+              <svg class="w-7 h-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Media Controls -->
+    <section class="grid grid-cols-4 gap-3 max-w-md mx-auto w-full pb-[max(8px,env(safe-area-inset-bottom))]">
+      <button type="button" class="remote-btn flex flex-col items-center justify-center gap-2 rounded-2xl bg-remote-surface py-4 transition-transform shadow-btn" data-action="back" aria-label="Back">
+        <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg>
+        <span class="text-[11px] text-remote-muted font-medium">Back</span>
+      </button>
+      <button type="button" class="remote-btn flex flex-col items-center justify-center gap-2 rounded-2xl bg-remote-surface py-4 transition-transform shadow-btn" data-action="home" aria-label="Home">
+        <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0h6"/></svg>
+        <span class="text-[11px] text-remote-muted font-medium">Home</span>
+      </button>
+      <button type="button" class="remote-btn flex flex-col items-center justify-center gap-2 rounded-2xl bg-remote-surface py-4 transition-transform shadow-btn" data-action="playpause" aria-label="Play Pause">
+        <svg id="playIcon" class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+        <span class="text-[11px] text-remote-muted font-medium">Play</span>
+      </button>
+      <button type="button" class="remote-btn flex flex-col items-center justify-center gap-2 rounded-2xl bg-remote-surface py-4 transition-transform shadow-btn" data-action="mute" aria-label="Mute">
+        <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M11 5L6 9H3v6h3l5 4V5zm4.5 3.5a4.5 4.5 0 010 7m3-9a8 8 0 010 12"/></svg>
+        <span class="text-[11px] text-remote-muted font-medium">Mute</span>
+      </button>
+    </section>
+  </main>
+
+  <!-- Toast -->
+  <div id="toast" class="fixed bottom-24 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full bg-remote-surface2/95 border border-white/10 text-sm text-white/90 opacity-0 pointer-events-none transition-opacity duration-300 z-50 whitespace-nowrap"></div>
+
+  <script>
+    const TVs = [
+      { id: 'living-room', name: 'Living Room Apple TV', connected: true },
+      { id: 'bedroom-lg', name: 'Bedroom LG TV', connected: false },
+      { id: 'office-samsung', name: 'Office Samsung TV', connected: false },
+    ];
+
+    let selectedTV = TVs[0];
+    let isPlaying = false;
+    let currentMode = 'touchpad';
+
+    const tvDropdown = document.getElementById('tvDropdown');
+    const tvSelectorBtn = document.getElementById('tvSelectorBtn');
+    const tvMenu = document.getElementById('tvMenu');
+    const tvList = document.getElementById('tvList');
+    const selectedTVName = document.getElementById('selectedTVName');
+    const statusDot = document.getElementById('statusDot');
+    const statusLabel = document.getElementById('statusLabel');
+    const touchpad = document.getElementById('touchpad');
+    const rippleLayer = document.getElementById('rippleLayer');
+    const swipeFeedback = document.getElementById('swipeFeedback');
+    const touchpadHint = document.getElementById('touchpadHint');
+    const toast = document.getElementById('toast');
+
+    function showToast(message) {
+      toast.textContent = message;
+      toast.style.opacity = '1';
+      clearTimeout(showToast._t);
+      showToast._t = setTimeout(() => { toast.style.opacity = '0'; }, 1200);
+    }
+
+    function updateConnectionUI() {
+      selectedTVName.textContent = selectedTV.name;
+      const connected = selectedTV.connected;
+      statusLabel.textContent = connected ? 'Connected' : 'Disconnected';
+      statusDot.className = `w-2.5 h-2.5 rounded-full shrink-0 ${connected ? 'bg-green-500' : 'bg-red-500'}${connected ? '' : ' status-pulse'}`;
+    }
+
+    function renderTVList() {
+      tvList.innerHTML = TVs.map(tv => `
+        <li>
+          <button type="button" class="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-white/5 active:bg-white/10 transition-colors ${tv.id === selectedTV.id ? 'bg-white/5' : ''}" data-tv-id="${tv.id}">
+            <span class="w-2 h-2 rounded-full ${tv.connected ? 'bg-green-500' : 'bg-remote-border'}"></span>
+            <span class="flex-1 text-[15px] font-medium truncate">${tv.name}</span>
+            ${tv.id === selectedTV.id ? '<svg class="w-5 h-5 text-remote-accent" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/></svg>' : ''}
+          </button>
+        </li>
+      `).join('');
+
+      tvList.querySelectorAll('[data-tv-id]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const tv = TVs.find(t => t.id === btn.dataset.tvId);
+          if (!tv) return;
+          selectedTV = tv;
+          selectedTV.connected = tv.id === 'living-room';
+          updateConnectionUI();
+          renderTVList();
+          closeDropdown();
+          showToast(selectedTV.connected ? `Connected to ${tv.name}` : `Selected ${tv.name}`);
+        });
+      });
+    }
+
+    function openDropdown() {
+      tvDropdown.classList.add('open');
+      tvSelectorBtn.setAttribute('aria-expanded', 'true');
+    }
+
+    function closeDropdown() {
+      tvDropdown.classList.remove('open');
+      tvSelectorBtn.setAttribute('aria-expanded', 'false');
+    }
+
+    tvSelectorBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      tvDropdown.classList.contains('open') ? closeDropdown() : openDropdown();
+    });
+
+    document.addEventListener('click', () => closeDropdown());
+
+    // Mode toggle
+    const modeTouchpad = document.getElementById('modeTouchpad');
+    const modeDpad = document.getElementById('modeDpad');
+    const touchpadPanel = document.getElementById('touchpadPanel');
+    const dpadPanel = document.getElementById('dpadPanel');
+
+    function setMode(mode) {
+      currentMode = mode;
+      const isTouch = mode === 'touchpad';
+      touchpadPanel.classList.toggle('active-mode', isTouch);
+      touchpadPanel.classList.toggle('hidden-mode', !isTouch);
+      dpadPanel.classList.toggle('active-mode', !isTouch);
+      dpadPanel.classList.toggle('hidden-mode', isTouch);
+      modeTouchpad.classList.toggle('bg-white/12', isTouch);
+      modeTouchpad.classList.toggle('text-white', isTouch);
+      modeTouchpad.classList.toggle('text-remote-muted', !isTouch);
+      modeDpad.classList.toggle('bg-white/12', !isTouch);
+      modeDpad.classList.toggle('text-white', !isTouch);
+      modeDpad.classList.toggle('text-remote-muted', isTouch);
+      modeTouchpad.setAttribute('aria-selected', isTouch);
+      modeDpad.setAttribute('aria-selected', !isTouch);
+    }
+
+    modeTouchpad.addEventListener('click', () => setMode('touchpad'));
+    modeDpad.addEventListener('click', () => setMode('dpad'));
+
+    // Ripple
+    function spawnRipple(x, y, container) {
+      const rect = container.getBoundingClientRect();
+      const ripple = document.createElement('span');
+      const size = 48;
+      ripple.className = 'ripple';
+      ripple.style.width = ripple.style.height = `${size}px`;
+      ripple.style.left = `${x - rect.left - size / 2}px`;
+      ripple.style.top = `${y - rect.top - size / 2}px`;
+      container.appendChild(ripple);
+      ripple.addEventListener('animationend', () => ripple.remove());
+    }
+
+    function showSwipeIndicator(direction) {
+      const icons = { up: '↑', down: '↓', left: '←', right: '→' };
+      const el = document.createElement('div');
+      el.className = 'swipe-hint absolute left-1/2 top-1/2 text-3xl font-semibold text-white/70';
+      el.textContent = icons[direction] || '•';
+      swipeFeedback.appendChild(el);
+      setTimeout(() => el.remove(), 1200);
+    }
+
+    function fireAction(action) {
+      if (!selectedTV.connected) {
+        showToast('Connect to a TV first');
+        return;
+      }
+      const labels = {
+        up: 'Up', down: 'Down', left: 'Left', right: 'Right',
+        select: 'Select', back: 'Back', home: 'Home',
+        playpause: isPlaying ? 'Pause' : 'Play', mute: 'Mute'
+      };
+      if (action === 'playpause') {
+        isPlaying = !isPlaying;
+        document.querySelector('[data-action="playpause"] span').textContent = isPlaying ? 'Pause' : 'Play';
+        document.getElementById('playIcon').innerHTML = isPlaying
+          ? '<path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/>'
+          : '<path d="M8 5v14l11-7z"/>';
+      }
+      showToast(labels[action] || action);
+    }
+
+    function pressButton(btn) {
+      btn.classList.add('pressed');
+      setTimeout(() => btn.classList.remove('pressed'), 140);
+    }
+
+    // Touchpad gestures
+    let touchStart = null;
+    const SWIPE_THRESHOLD = 36;
+
+    touchpad.addEventListener('pointerdown', (e) => {
+      touchpad.setPointerCapture(e.pointerId);
+      touchStart = { x: e.clientX, y: e.clientY, time: Date.now() };
+      touchpadHint.style.opacity = '0';
+      spawnRipple(e.clientX, e.clientY, rippleLayer);
+    });
+
+    touchpad.addEventListener('pointerup', (e) => {
+      if (!touchStart) return;
+      const dx = e.clientX - touchStart.x;
+      const dy = e.clientY - touchStart.y;
+      const elapsed = Date.now() - touchStart.time;
+      const dist = Math.hypot(dx, dy);
+
+      if (dist < 12 && elapsed < 280) {
+        fireAction('select');
+        spawnRipple(e.clientX, e.clientY, rippleLayer);
+      } else if (dist >= SWIPE_THRESHOLD) {
+        const direction = Math.abs(dx) > Math.abs(dy)
+          ? (dx > 0 ? 'right' : 'left')
+          : (dy > 0 ? 'down' : 'up');
+        showSwipeIndicator(direction);
+        fireAction(direction);
+      }
+
+      touchStart = null;
+      setTimeout(() => { touchpadHint.style.opacity = '1'; }, 800);
+    });
+
+    touchpad.addEventListener('pointercancel', () => { touchStart = null; });
+
+    // D-pad & media buttons
+    document.querySelectorAll('.dpad-btn, .remote-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        pressButton(btn);
+        fireAction(btn.dataset.action);
+      });
+    });
+
+    // Init
+    renderTVList();
+    updateConnectionUI();
+    setMode('touchpad');
+  </script>
+</body>
+</html>
