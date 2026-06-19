@@ -988,10 +988,10 @@ final class TVController {
         return discoveredTVs.first
     }
 
-    // MARK: Private — LG ROAP HTTP Connection
+    // MARK: Private — LG NetCast ROAP
 
-    /// Marks an LG TV as connected — commands use HTTP POST, no WebSocket pairing.
-    private func establishLGHTTPConnection(
+    /// NetCast TVs accept ROAP over HTTP :8080 — no WebSocket pairing required.
+    private func establishLGNetCastConnection(
         to address: String,
         displayName: String?,
         persistCache: Bool
@@ -1004,32 +1004,35 @@ final class TVController {
 
         pairingTimeoutTask?.cancel()
         pairingTimeoutTask = nil
+        lgPendingRequests.removeAll()
+        lgInputWebSocketTask?.cancel(with: .goingAway, reason: nil)
+        lgInputWebSocketTask = nil
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
         activePairingAddress = nil
         activePairingPort = nil
 
         tvIPAddress = host
+        activeWebSocketBackend = .lgNetCast
         if let displayName {
             activeDeviceName = displayName
         }
 
         if let match = discoveredTVs.first(where: { $0.sanitizedAddress == host }) {
             selectedTV = match
-        } else if var current = selectedTV {
-            current = DiscoveredTV(
-                id: host.lowercased(),
-                name: current.name,
-                address: host,
-                modelName: current.modelName,
-                protocols: current.protocols
-            )
-            selectedTV = current
         }
 
         lastErrorMessage = nil
         isConnecting = false
         isConnected = true
+
+        if var tv = selectedTV {
+            tv.lgProtocolType = .netcast
+            selectedTV = tv
+            persistLGProtocolType(.netcast, for: tv.id)
+        }
+
+        print("✅ LG NetCast ready at \(host) — ROAP :8080")
 
         if persistCache {
             cachedTVIP = host
@@ -1037,6 +1040,260 @@ final class TVController {
                 persistCachedDeviceName(name)
             }
         }
+    }
+
+    // MARK: Private — LG webOS WebSocket
+
+    private func beginLGWebSocketConnection(
+        to address: String,
+        displayName: String?,
+        persistCache: Bool
+    ) {
+        let host = sanitizedSamsungHost(address)
+        guard !host.isEmpty else {
+            lastErrorMessage = "Invalid device address."
+            return
+        }
+
+        if isConnecting,
+           activePairingAddress == host,
+           activeWebSocketBackend == .lgWebOS,
+           webSocketTask != nil {
+            return
+        }
+
+        if isConnected,
+           activePairingAddress == host,
+           activeWebSocketBackend == .lgWebOS,
+           lgInputWebSocketTask != nil {
+            return
+        }
+
+        pairingTimeoutTask?.cancel()
+        lgPendingRequests.removeAll()
+        lgForceRePairAttempted = false
+        lgRegisterSent = false
+        lgActivePersistCache = persistCache
+        lgInputWebSocketTask?.cancel(with: .goingAway, reason: nil)
+        lgInputWebSocketTask = nil
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = nil
+
+        tvIPAddress = host
+        activePairingAddress = host
+        activePairingPort = Self.lgWebSocketPort
+        didAttemptPortFallback = false
+        activeWebSocketBackend = .lgWebOS
+        if let displayName {
+            activeDeviceName = displayName
+        }
+
+        if let match = discoveredTVs.first(where: { $0.sanitizedAddress == host }) {
+            selectedTV = match
+        }
+
+        lastErrorMessage = nil
+        isConnected = false
+        isConnecting = true
+
+        openLGWebSocket(to: host, persistCache: persistCache)
+    }
+
+    private func openLGWebSocket(to host: String, persistCache: Bool) {
+        guard let url = lgWebSocketURL(for: host) else {
+            isConnecting = false
+            lastErrorMessage = "Invalid device address."
+            return
+        }
+
+        print("Connecting LG webOS WebSocket at \(url.absoluteString)")
+
+        let task = lgWebSocketSession.webSocketTask(with: url)
+        webSocketTask = task
+        task.resume()
+
+        sendLGHello()
+        scheduleLGRegisterFallback()
+        listenForWebSocketMessages(
+            persistCache: persistCache,
+            address: host,
+            port: Self.lgWebSocketPort
+        )
+        startLGPairingTimeout(host: host, persistCache: persistCache)
+    }
+
+    private func startLGPairingTimeout(host: String, persistCache: Bool) {
+        pairingTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(Self.connectionTimeout))
+            guard let self, !Task.isCancelled, self.isConnecting, !self.isConnected else { return }
+            self.applyConnectionFailure("Pairing timed out — approve the connection on your LG TV.")
+        }
+    }
+
+    private func scheduleLGRegisterFallback() {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(900))
+            guard let self,
+                  self.isConnecting,
+                  !self.isConnected,
+                  !self.lgRegisterSent,
+                  self.webSocketTask != nil else { return }
+            print("LG hello timeout — registering directly")
+            self.sendLGRegisterHandshake()
+        }
+    }
+
+    private func sendLGHello() {
+        let envelope: [String: Any] = [
+            "type": "hello",
+            "id": "hello_0",
+            "payload": [String: Any]()
+        ]
+        sendLGWebSocketJSON(envelope)
+    }
+
+    private func sendLGRegisterHandshake(forcePairing: Bool = false) {
+        lgRegisterSent = true
+        var payload = Self.lgRegistrationPayload
+        if forcePairing {
+            payload["forcePairing"] = true
+            payload.removeValue(forKey: "client-key")
+        } else if !lgClientKey.isEmpty {
+            payload["client-key"] = lgClientKey
+        }
+
+        let envelope: [String: Any] = [
+            "type": "register",
+            "id": "register_0",
+            "payload": payload
+        ]
+        sendLGWebSocketJSON(envelope)
+    }
+
+    private func isLGPermissionError(_ message: String) -> Bool {
+        let normalized = message.lowercased()
+        return normalized.contains("401")
+            || normalized.contains("insufficient permission")
+            || normalized.contains("not allowed")
+    }
+
+    private func handleLGPermissionDenied(host: String) {
+        if lgForceRePairAttempted {
+            applyConnectionFailure(
+                "LG TV denied remote control. Check Settings → General → Mobile App Connection."
+            )
+            return
+        }
+
+        lgForceRePairAttempted = true
+        lgClientKey = ""
+        UserDefaults.standard.removeObject(forKey: Self.lgClientKeyStorageKey)
+        lgInputWebSocketTask?.cancel(with: .goingAway, reason: nil)
+        lgInputWebSocketTask = nil
+        isConnected = false
+        isConnecting = true
+        lastErrorMessage = "Approve ZapRemote on your LG TV to allow remote control."
+        print("⚠️ LG 401 — clearing saved key and forcing re-pair")
+
+        sendLGRegisterHandshake(forcePairing: true)
+    }
+
+    private func sendLGWebSocketJSON(_ envelope: [String: Any]) {
+        guard let task = webSocketTask,
+              let data = try? JSONSerialization.data(withJSONObject: envelope),
+              let json = String(data: data, encoding: .utf8) else {
+            lastErrorMessage = TVControllerError.encodingFailed.localizedDescription
+            return
+        }
+
+        task.send(.string(json)) { [weak self] error in
+            if let error {
+                DispatchQueue.main.async {
+                    self?.applyConnectionFailure(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func requestLGService(
+        uri: String,
+        payload: [String: Any] = [:],
+        completion: @escaping (Result<[String: Any], Error>) -> Void
+    ) {
+        lgCommandCounter += 1
+        let requestID = "lg_req_\(lgCommandCounter)"
+        lgPendingRequests[requestID] = completion
+
+        let envelope: [String: Any] = [
+            "type": "request",
+            "id": requestID,
+            "uri": "ssap://\(uri)",
+            "payload": payload
+        ]
+        sendLGWebSocketJSON(envelope)
+    }
+
+    private func requestLGPointerInputSocket(host: String, persistCache: Bool) {
+        requestLGService(uri: "com.webos.service.networkinput/getPointerInputSocket") { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+
+                switch result {
+                case .success(let payload):
+                    guard let socketPath = payload["socketPath"] as? String,
+                          let url = self.lgInputSocketURL(socketPath, fallbackHost: host) else {
+                        self.applyConnectionFailure("LG input socket unavailable.")
+                        return
+                    }
+                    self.openLGInputWebSocket(url: url, host: host)
+
+                case .failure(let error):
+                    let message = error.localizedDescription
+                    print("❌ LG input socket request failed: \(message)")
+                    if self.isLGPermissionError(message) {
+                        self.handleLGPermissionDenied(host: host)
+                    } else {
+                        self.applyConnectionFailure(message)
+                    }
+                }
+            }
+        }
+    }
+
+    private func openLGInputWebSocket(url: URL, host: String) {
+        lgInputWebSocketTask?.cancel(with: .goingAway, reason: nil)
+
+        print("Opening LG input socket at \(url.absoluteString)")
+
+        let task = lgWebSocketSession.webSocketTask(with: url)
+        lgInputWebSocketTask = task
+        task.resume()
+
+        if var tv = selectedTV {
+            tv.lgProtocolType = .webOS
+            selectedTV = tv
+            persistLGProtocolType(.webOS, for: tv.id)
+        }
+
+        isConnected = true
+        isConnecting = false
+        lgForceRePairAttempted = false
+        lastErrorMessage = nil
+        print("✅ LG remote ready at \(host)")
+    }
+
+    private func lgInputSocketURL(_ socketPath: String, fallbackHost: String) -> URL? {
+        if socketPath.hasPrefix("ws://") || socketPath.hasPrefix("wss://") {
+            return URL(string: socketPath)
+        }
+        if socketPath.hasPrefix("/") {
+            return URL(string: "ws://\(fallbackHost):\(Self.lgWebSocketPort)\(socketPath)")
+        }
+        return URL(string: socketPath)
+    }
+
+    private func lgWebSocketURL(for host: String) -> URL? {
+        URL(string: "ws://\(host):\(Self.lgWebSocketPort)/")
     }
 
     // MARK: Commands
@@ -1271,15 +1528,13 @@ final class TVController {
         request.httpMethod = "POST"
 
         session.dataTask(with: request) { [weak self] _, _, error in
-            if let error {
-                DispatchQueue.main.async {
-                    self?.lastErrorMessage = "Could not connect to the server."
-                }
-                return
-            }
-
             DispatchQueue.main.async {
-                self?.lastErrorMessage = nil
+                guard let self else { return }
+                if error != nil {
+                    self.lastErrorMessage = "Could not connect to the server."
+                    return
+                }
+                self.lastErrorMessage = nil
             }
         }.resume()
 
