@@ -2,17 +2,67 @@
 //  ZapRemoteApp.swift
 //  ZapRemote
 //
-//  Universal TV remote — discover a TV on your network and control it with arrows.
+//  Premium automation TV remote — flat $10/mo model.
 //
 
 import SwiftUI
 
 @main
 struct ZapRemoteApp: App {
+    @StateObject private var tvController = TVController()
+    @StateObject private var sportsAPIService = SportsAPIService()
+    @StateObject private var adEventService = AdEventService()
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .preferredColorScheme(.dark)
+            TabView {
+                ContentView(
+                    tvController: tvController,
+                    sportsAPIService: sportsAPIService,
+                    adEventService: adEventService
+                )
+                .tabItem {
+                    Label("Home", systemImage: "tv.and.mediabox")
+                }
+
+                SettingsView(
+                    tvController: tvController,
+                    sportsAPIService: sportsAPIService,
+                    adEventService: adEventService
+                )
+                .tabItem {
+                    Label("Settings", systemImage: "gearshape")
+                }
+            }
+            .preferredColorScheme(.dark)
+            .onAppear {
+                sportsAPIService.configure(tvController: tvController)
+                adEventService.configure(tvController: tvController)
+                adEventService.sportsAPIService = sportsAPIService
+                adEventService.subscribedGameID = sportsAPIService.monitoredGameID
+                adEventService.streamDelayOffsetSeconds = Int(
+                    sportsAPIService.streamDelaySeconds.rounded()
+                )
+                if adEventService.isCloudURLConfigured {
+                    adEventService.startListening()
+                }
+
+                if sportsAPIService.hasMonitoredGame {
+                    sportsAPIService.startGamePolling()
+                }
+            }
+            .onChange(of: sportsAPIService.streamDelaySeconds) { _, delay in
+                adEventService.streamDelayOffsetSeconds = Int(delay.rounded())
+            }
+            .onChange(of: sportsAPIService.monitoredGameID) { _, newGameID in
+                adEventService.subscribedGameID = newGameID
+                let trimmed = newGameID.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty {
+                    sportsAPIService.stopGamePolling()
+                } else {
+                    sportsAPIService.startLiveGameMonitoring(gameID: trimmed)
+                }
+            }
         }
     }
 }
