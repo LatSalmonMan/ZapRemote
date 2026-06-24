@@ -35,6 +35,7 @@ struct ZapRemoteApp: App {
                 }
             }
             .preferredColorScheme(.dark)
+            .background(Color(red: 0.08, green: 0.08, blue: 0.09).ignoresSafeArea())
             .onAppear {
                 sportsAPIService.configure(tvController: tvController)
                 adEventService.configure(tvController: tvController)
@@ -49,6 +50,11 @@ struct ZapRemoteApp: App {
 
                 if sportsAPIService.hasMonitoredGame {
                     sportsAPIService.startGamePolling()
+                }
+            }
+            .onChange(of: sportsAPIService.isHandsFreeAutomationEnabled) { _, enabled in
+                if enabled, adEventService.isCloudURLConfigured {
+                    adEventService.startListening()
                 }
             }
             .onChange(of: sportsAPIService.streamDelaySeconds) { _, delay in

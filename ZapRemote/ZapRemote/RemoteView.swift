@@ -44,7 +44,7 @@ private enum HomeSessionState: Equatable {
         case .watchingLive:
             "Tap Ad on my TV when commercials start."
         case .commercialBreak:
-            "Rewinding — back to live in ~25s."
+            "Watching highlight — Go Live in ~45s."
         case .attention:
             "Check connection and try again."
         }
@@ -114,7 +114,7 @@ struct RemoteView: View {
         case .watchingLive where sportsAPIService.isHandsFreeAutomationEnabled:
             return "Hands-free ON — halftime & TV timeouts auto-skip to ESPN highlights."
         case .needsLagSync:
-            return "Tap Match Clock — use − and + until it matches your TV."
+            return "ESPN shows live — tap Match Clock and line up YOUR TV with your screen."
         default:
             return sessionState.heroSubtitle
         }
@@ -124,19 +124,25 @@ struct RemoteView: View {
         if tvController.isMacroRunning || tvController.isExecutingMacro {
             return "Skipping on TV… keep \(streamingService.rawValue) in the foreground (~10s lock)."
         }
-        if !sportsAPIService.lastStatusSummary.isEmpty,
-           sportsAPIService.lastStatusSummary != "ESPN polling stopped" {
-            return sportsAPIService.lastStatusSummary
+        if let summary = meaningfulStatusSummary {
+            return summary
         }
         if !tvController.statusMessage.isEmpty,
            tvController.statusMessage != "Disconnected",
            !tvController.statusMessage.hasPrefix("Remote ready") {
             return tvController.statusMessage
         }
-        if let recent = sportsAPIService.activityLog.first {
-            return recent
-        }
         return nil
+    }
+
+    /// Avoid flashing ESPN poll noise ("In progress — …") on every 4s tick.
+    private var meaningfulStatusSummary: String? {
+        let summary = sportsAPIService.lastStatusSummary
+        guard !summary.isEmpty, summary != "ESPN polling stopped" else { return nil }
+        if summary.hasPrefix("In progress —") { return nil }
+        if summary.hasPrefix("Polling ESPN game") { return nil }
+        if summary == "Awaiting ESPN polling start" { return nil }
+        return summary
     }
 
     private var statusFootnoteIsWarning: Bool {
@@ -149,8 +155,29 @@ struct RemoteView: View {
             || text.contains("test skip")
     }
 
+    private var rewindStickerPhase: RewindStickerPhase? {
+        if tvController.isReturningToLive {
+            return .returningToLive
+        }
+        if tvController.isMacroRunning || tvController.isExecutingMacro {
+            return .rewinding
+        }
+        if sportsAPIService.pendingAutoGoLive || sportsAPIService.isCommercialBreakLoopActive {
+            let current = sportsAPIService.commercialBreakHighlightIndex
+            let total = sportsAPIService.commercialBreakPlaylist.count
+            if total > 1, current > 0 {
+                return .watchingHighlight(current: current, total: total)
+            }
+            return .watchingHighlight(current: nil, total: nil)
+        }
+        if sportsAPIService.isBreakActive, !sportsAPIService.isCommercialBreakLoopActive {
+            return .rewinding
+        }
+        return nil
+    }
+
     var body: some View {
-        ZStack {
+        ZStack(alignment: .top) {
             CouchModeScreenBackground(theme: theme, streamingAccent: streamingService.accent)
 
             ScrollView(.vertical, showsIndicators: false) {
@@ -167,18 +194,23 @@ struct RemoteView: View {
                         onResetTV: onResetTV
                     )
 
-                    HomeHeroCard(
-                        theme: theme,
-                        state: sessionState,
-                        subtitle: heroSubtitleText,
-                        streamingService: streamingService,
-                        streamDelaySeconds: sportsAPIService.streamDelaySeconds,
-                        trackedGameLabel: sportsAPIService.monitoredGameLabel,
-                        highlightRank: sportsAPIService.selectedHighlightRank,
-                        plannedRewindSeconds: sportsAPIService.lastPlannedRewindSeconds,
-                        liveGameClockLabel: sportsAPIService.liveGameClockLabel,
-                        onChangeGame: { isGameSearchPresented = true }
-                    )
+                    TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                        let now = timeline.date
+                        HomeHeroCard(
+                            theme: theme,
+                            state: sessionState,
+                            subtitle: heroSubtitleText,
+                            streamingService: streamingService,
+                            streamDelaySeconds: sportsAPIService.streamDelaySeconds,
+                            trackedGameLabel: sportsAPIService.monitoredGameLabel,
+                            highlightRank: sportsAPIService.selectedHighlightRank,
+                            plannedRewindSeconds: sportsAPIService.lastPlannedRewindSeconds,
+                            espnLiveClockLabel: sportsAPIService.espnLiveClockDisplay(at: now)
+                                ?? sportsAPIService.liveGameClockLabel,
+                            syncedGameClockLabel: sportsAPIService.uiGameClockDisplay(at: now),
+                            onChangeGame: { isGameSearchPresented = true }
+                        )
+                    }
 
                     HomeControlDeck(
                         theme: theme,
@@ -209,6 +241,7 @@ struct RemoteView: View {
                             .multilineTextAlignment(.center)
                             .frame(maxWidth: .infinity)
                             .padding(.horizontal, 8)
+                            .animation(nil, value: statusFootnote)
                     }
 
                     Button {
@@ -225,8 +258,14 @@ struct RemoteView: View {
                 .padding(.top, 12)
                 .padding(.bottom, 32)
             }
+
+            if let phase = rewindStickerPhase {
+                RewindFlowSticker(phase: phase, theme: theme)
+                    .padding(.top, 6)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
         }
-        .animation(.easeInOut(duration: 0.3), value: sessionState)
+        .animation(.spring(response: 0.38, dampingFraction: 0.82), value: rewindStickerPhase)
         .sheet(isPresented: $isGameSearchPresented) {
             GameSearchSheet(sportsAPIService: sportsAPIService)
                 .preferredColorScheme(.dark)
@@ -262,6 +301,62 @@ struct RemoteView: View {
 
         sportsAPIService.clearBreakForManualGoLive()
         Task { await tvController.executeGoLiveMacro() }
+    }
+}
+
+// MARK: - Rewind Sticker
+
+private enum RewindStickerPhase: Equatable {
+    case rewinding
+    case watchingHighlight(current: Int?, total: Int?)
+    case returningToLive
+
+    var icon: String {
+        switch self {
+        case .rewinding: "backward.fill"
+        case .watchingHighlight: "play.fill"
+        case .returningToLive: "forward.end.fill"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .rewinding:
+            return "Rewinding"
+        case .watchingHighlight(let current, let total):
+            if let current, let total, total > 1 {
+                return "Highlight \(current)/\(total)"
+            }
+            return "Highlight"
+        case .returningToLive:
+            return "Back to live"
+        }
+    }
+}
+
+private struct RewindFlowSticker: View {
+    let phase: RewindStickerPhase
+    let theme: AppTheme
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: phase.icon)
+                .font(.caption.weight(.black))
+            Text(phase.label)
+                .font(.caption.weight(.bold))
+        }
+        .foregroundStyle(Color.black.opacity(0.86))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(
+            Capsule(style: .continuous)
+                .fill(theme.accentPrimary)
+                .shadow(color: theme.accentPrimary.opacity(0.5), radius: 10, y: 4)
+        )
+        .overlay(
+            Capsule(style: .continuous)
+                .strokeBorder(Color.white.opacity(0.25), lineWidth: 1)
+        )
     }
 }
 
@@ -359,7 +454,8 @@ private struct HomeHeroCard: View {
     var trackedGameLabel: String = ""
     var highlightRank: Int = 0
     var plannedRewindSeconds: Int = 0
-    var liveGameClockLabel: String = "—"
+    var espnLiveClockLabel: String = "—"
+    var syncedGameClockLabel: String = "—"
     var onChangeGame: (() -> Void)? = nil
 
     var body: some View {
@@ -381,7 +477,7 @@ private struct HomeHeroCard: View {
             VStack(spacing: 6) {
                 Text(state.heroTitle)
                     .font(.title3.weight(.bold))
-                    .foregroundStyle(theme.headerGradient)
+                    .foregroundStyle(theme.accentPrimary)
                     .multilineTextAlignment(.center)
 
                 Text(subtitle)
@@ -413,19 +509,22 @@ private struct HomeHeroCard: View {
 
             if state == .watchingLive || state == .commercialBreak || state == .needsLagSync {
                 HStack(spacing: 20) {
-                    if state == .needsLagSync, liveGameClockLabel != "—" {
-                        heroFact(label: "ESPN", value: liveGameClockLabel)
+                    if state == .needsLagSync, espnLiveClockLabel != "—" {
+                        heroFact(label: "ESPN live", value: espnLiveClockLabel)
                     }
                     if state == .watchingLive || state == .commercialBreak {
+                        heroFact(label: "TV clock", value: syncedGameClockLabel)
                         heroFact(label: "Lag", value: "\(Int(streamDelaySeconds.rounded()))s")
                     }
-                    if highlightRank > 0 {
+                    if highlightRank > 0, state != .needsLagSync {
                         heroFact(label: "Rank", value: rankDisplay(highlightRank))
                     }
-                    if plannedRewindSeconds > 0 {
+                    if plannedRewindSeconds > 0, state != .needsLagSync {
                         heroFact(label: "Skip", value: "\(plannedRewindSeconds)s")
                     }
                 }
+                .animation(nil, value: plannedRewindSeconds)
+                .animation(nil, value: highlightRank)
             }
         }
         .frame(maxWidth: .infinity)
@@ -600,7 +699,7 @@ private struct HomeControlButton: View {
             )
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
-        .buttonStyle(.borderless)
+        .buttonStyle(.plain)
         .disabled(!isEnabled)
     }
 }

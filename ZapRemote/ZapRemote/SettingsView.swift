@@ -73,6 +73,7 @@ struct SettingsView: View {
 
                 List {
                     tonightSection
+                    tvConnectionAndDelaySection
                     cloudSection
                     premiumSection
                     moreSection
@@ -149,18 +150,14 @@ struct SettingsView: View {
                 HStack {
                     Label {
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(sportsAPIService.hasSyncedStreamLag ? "TV clock synced" : "Match TV clock")
+                            Text("Match clock (full screen)")
                                 .foregroundStyle(.white.opacity(0.90))
-                            Text(
-                                sportsAPIService.hasSyncedStreamLag
-                                    ? "\(sportsAPIService.liveGameClockLabel) · \(Int(sportsAPIService.streamDelaySeconds.rounded()))s delay"
-                                    : "Tap +/− until the clock matches your TV"
-                            )
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.40))
+                            Text("Larger ± clock UI for fine-tuning beyond 60s")
+                                .font(.caption)
+                                .foregroundStyle(.white.opacity(0.40))
                         }
                     } icon: {
-                        Image(systemName: "clock.badge.checkmark")
+                        Image(systemName: "clock.arrow.2.circlepath")
                     }
                     Spacer()
                     Image(systemName: "chevron.right")
@@ -175,7 +172,7 @@ struct SettingsView: View {
             Toggle(isOn: $sportsAPIService.isHandsFreeAutomationEnabled) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Hands-free ad skip")
-                    Text("ESPN stoppage → auto rewind · ~25s later → Go Live")
+                    Text("ESPN stoppage or cloud ad_start → up to 3 highlights → Go Live")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.40))
                 }
@@ -185,7 +182,7 @@ struct SettingsView: View {
             Toggle(isOn: $sportsAPIService.autoReturnToLiveAfterHighlight) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Auto Go Live after highlight")
-                    Text("Waits ~25s on the highlight, then jumps back to live so you can confirm the skip worked")
+                    Text("Waits ~45–60s on the highlight, then jumps back to live")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.40))
                 }
@@ -200,6 +197,34 @@ struct SettingsView: View {
             SettingsSectionHeader(title: "Tonight", icon: "sportscourt")
         } footer: {
             Text("Open YouTube TV, Hulu, or Peacock on your TV before using skip macros.")
+        }
+    }
+
+    private var tvConnectionAndDelaySection: some View {
+        Section {
+            HStack(spacing: 12) {
+                Circle()
+                    .fill(tvController.isConnected ? theme.accentPrimary : Color.white.opacity(0.25))
+                    .frame(width: 10, height: 10)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(tvController.isConnected ? "TV connected" : "TV not connected")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.88))
+                    Text(tvController.connectionStatusHeadline)
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.42))
+                }
+                Spacer()
+            }
+            .listRowBackground(SettingsRowBackground())
+
+            StreamDelayHueSyncPanel(apiService: sportsAPIService, theme: theme)
+                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 12, trailing: 16))
+                .listRowBackground(SettingsRowBackground())
+        } header: {
+            SettingsSectionHeader(title: "TV Connection & Delay", icon: "tv.and.hifispeaker.fill")
+        } footer: {
+            Text("Drag the slider until the app clock matches your TV. The offset feeds highlight skip timing instantly.")
         }
     }
 
@@ -405,6 +430,105 @@ private struct SettingsRowBackground: View {
     var body: some View {
         RoundedRectangle(cornerRadius: 10, style: .continuous)
             .fill(Color.white.opacity(0.05))
+    }
+}
+
+// MARK: - Hue-Style Stream Delay Sync
+
+private struct StreamDelayHueSyncPanel: View {
+    @ObservedObject var apiService: SportsAPIService
+    let theme: AppTheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            timeSyncReadoutPanel
+
+            VStack(alignment: .leading, spacing: 10) {
+                Slider(
+                    value: $apiService.streamDelaySeconds,
+                    in: SportsAPIService.settingsSliderDelayRange,
+                    step: SportsAPIService.settingsSliderStep
+                )
+                .tint(theme.accentPrimary)
+
+                HStack {
+                    Text("0s")
+                    Spacer()
+                    Text("60s")
+                }
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.32))
+            }
+
+            streamOffsetReadoutCard
+        }
+        .padding(.vertical, 4)
+        .animation(.easeInOut(duration: 0.22), value: apiService.streamDelaySeconds)
+    }
+
+    private var timeSyncReadoutPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(
+                "Instructions: Compare the clock below with your television screen. "
+                + "Move the slider until the app timeline matches your TV feed exactly."
+            )
+            .font(.caption)
+            .foregroundStyle(.white.opacity(0.48))
+            .fixedSize(horizontal: false, vertical: true)
+
+            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                let clock = apiService.syncedTimelineClockDisplay(at: timeline.date)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("APP TIMELINE")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.white.opacity(0.35))
+
+                    Text(clock)
+                        .font(.system(size: 38, weight: .bold, design: .rounded))
+                        .foregroundStyle(theme.accentPrimary)
+                        .monospacedDigit()
+                        .minimumScaleFactor(0.55)
+                        .lineLimit(1)
+                        .contentTransition(.numericText())
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .animation(.easeInOut(duration: 0.22), value: apiService.streamDelaySeconds)
+            }
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+        )
+    }
+
+    private var streamOffsetReadoutCard: some View {
+        Text(apiService.streamOffsetReadout)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(theme.headerGradient)
+            .multilineTextAlignment(.leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                theme.accentPrimary.opacity(0.22),
+                                theme.accentSecondary.opacity(0.10)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .strokeBorder(theme.accentPrimary.opacity(0.35), lineWidth: 1)
+                    )
+            )
+            .contentTransition(.numericText())
     }
 }
 

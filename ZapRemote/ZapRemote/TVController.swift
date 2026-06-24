@@ -157,7 +157,14 @@ final class TVController: ObservableObject {
 
     /// Exact LEFT clicks from the last rewind — mirrored for return-to-live.
     private(set) var lastRewindClickCount: Int = 0
+
+    /// Restores the rewind ledger after auto Go Live scheduling (ESPN resume must not zero it).
+    func restoreRewindClickCount(_ count: Int) {
+        guard count > 0 else { return }
+        lastRewindClickCount = count
+    }
     @Published private(set) var isMacroRunning = false
+    @Published private(set) var isReturningToLive = false
 
     /// THE ANTI-LOOP SAFETY LOCK. True for the entire rewind lifecycle — clicks,
     /// trailing PLAY, and the 10s cooldown — not just the click loop itself.
@@ -496,29 +503,20 @@ final class TVController: ObservableObject {
             return
         }
 
-        let clicks = lastRewindClickCount
-        guard clicks > 0 else {
+        guard lastRewindClickCount > 0 else {
             statusMessage = "No rewind to undo — wait for a commercial rewind first."
             return
         }
 
-        statusMessage = "Returning to live game (\(clicks) skips forward)…"
-
-        runPointerMacro(
-            direction: "RIGHT",
-            totalClicks: clicks,
-            actionLabel: "Returning to live",
-            clearsRewindLedger: true
-        )
+        Task { await executeGoLiveMacro() }
     }
 
     /// Waits for an in-flight rewind macro, then returns to live with the stored click count.
     func returnToLiveEdgeWhenReady() async {
-        while isMacroRunning {
+        while isMacroRunning || isExecutingMacro {
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
-        guard lastRewindClickCount > 0 else { return }
-        returnToLiveEdge()
+        await executeGoLiveMacro()
     }
 
     func cancelActiveMacro() {
@@ -530,7 +528,7 @@ final class TVController: ObservableObject {
 
     // MARK: 5b — THE "JUMP TO LIVE" RESET MACRO
 
-    /// Returns to the live edge using the exact RIGHT-click count from the last rewind.
+    /// Returns to the live edge — re-opens the YTTV scrub bar, then RIGHT-clicks forward.
     func executeGoLiveMacro() async {
         guard connectionPhase == .ready, pointerWebSocket != nil else {
             statusMessage = "Connect to the TV before jumping to live."
@@ -545,13 +543,91 @@ final class TVController: ObservableObject {
             return
         }
 
+        guard await refreshPointerInputSocket() else {
+            statusMessage = "TV input channel lost — tap Reset and reconnect."
+            return
+        }
+
+        isMacroRunning = true
+        isReturningToLive = true
         statusMessage = "Returning to live (\(clicks)× forward)…"
-        runPointerMacro(
-            direction: "RIGHT",
-            totalClicks: clicks,
-            actionLabel: "Returning to live",
-            clearsRewindLedger: true
+
+        defer {
+            isMacroRunning = false
+            isReturningToLive = false
+        }
+
+        // After rewind + ENTER the scrubber closes — open it again before RIGHT skips.
+        sendPointerClick()
+        try? await Task.sleep(for: .milliseconds(450))
+        sendPointerButton("LEFT")
+        try? await Task.sleep(for: .milliseconds(550))
+
+        let spacingMs = resolvedClickSpacingMs()
+        for index in 0..<clicks {
+            guard !Task.isCancelled, connectionPhase == .ready else { return }
+            sendPointerButton("RIGHT")
+            if index < clicks - 1 {
+                try? await Task.sleep(for: .milliseconds(spacingMs))
+            }
+        }
+
+        try? await Task.sleep(for: .milliseconds(400))
+        sendPointerButton("ENTER")
+
+        lastRewindClickCount = 0
+        isExecutingMacro = false
+        statusMessage = "Returned to live — \(clicks)× forward, confirmed."
+    }
+
+    /// Waits for an in-flight macro and the post-skip settle window.
+    func waitForMacroCycleToFinish() async {
+        while isMacroRunning || isExecutingMacro {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        try? await Task.sleep(nanoseconds: 4_000_000_000)
+    }
+
+    /// Skips forward on the DVR scrub bar — decrements the live-edge ledger per click.
+    func skipForwardOnScrubBar(targetSeconds: Int) async -> Bool {
+        guard connectionPhase == .ready, pointerWebSocket != nil else {
+            statusMessage = "Connect to the TV before skipping forward."
+            return false
+        }
+        guard !isMacroRunning, !isExecutingMacro else { return false }
+        guard let secondsPerClick = resolvedSecondsPerClick() else { return false }
+
+        let totalClicks = min(
+            Self.maxMacroClicks,
+            max(1, (targetSeconds + secondsPerClick - 1) / secondsPerClick)
         )
+        guard totalClicks > 0 else { return true }
+
+        guard await refreshPointerInputSocket() else {
+            statusMessage = "TV input channel lost — tap Reset and reconnect."
+            return false
+        }
+
+        isMacroRunning = true
+        defer { isMacroRunning = false }
+
+        sendPointerClick()
+        try? await Task.sleep(for: .milliseconds(450))
+        sendPointerButton("LEFT")
+        try? await Task.sleep(for: .milliseconds(550))
+
+        let spacingMs = resolvedClickSpacingMs()
+        for index in 0..<totalClicks {
+            sendPointerButton("RIGHT")
+            lastRewindClickCount = max(0, lastRewindClickCount - 1)
+            if index < totalClicks - 1 {
+                try? await Task.sleep(for: .milliseconds(spacingMs))
+            }
+        }
+
+        try? await Task.sleep(for: .milliseconds(400))
+        sendPointerButton("ENTER")
+        return true
     }
 
     private func runPointerMacro(direction: String, targetSeconds: Int, actionLabel: String) {

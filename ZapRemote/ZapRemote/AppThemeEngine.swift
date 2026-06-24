@@ -99,7 +99,11 @@ struct PremiumCardChrome: ViewModifier {
                             )
                     )
             )
-            .modifier(PremiumGlowEngine(theme: theme, isActive: isActive))
+            .shadow(
+                color: theme.glowColor.opacity(isActive ? 0.22 : 0.06),
+                radius: isActive ? 10 : 4,
+                y: 3
+            )
     }
 }
 
