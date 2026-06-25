@@ -97,6 +97,95 @@ private struct ESPNStatusType: Decodable, Sendable {
     let shortDetail: String?
 }
 
+// MARK: - Kickoff Verification Gate
+
+/// Blocks ESPN "ghost clocks" (scheduled-time ticks before the TV broadcast kicks off).
+private enum KickoffVerificationGate {
+
+    private static let kickoffKeywords = [
+        "kickoff", "kick off", "kick-off",
+        "match started", "match begins", "match underway",
+        "whistle", "underway",
+        "tip-off", "tipoff", "tip off",
+        "game start", "starts with",
+        "opening play", "first play",
+        "face-off", "faceoff",
+        "possession",
+    ]
+
+    private static let preMatchFluffKeywords = [
+        "lineup", "line-up", "national anthem", "anthem",
+        "formation", "warm-up", "warm up", "coin toss", "toss",
+        "pregame", "pre-game", "pre game",
+    ]
+
+    private static let preGameStatusNames: Set<String> = [
+        "STATUS_SCHEDULED",
+        "STATUS_DELAYED",
+        "STATUS_POSTPONED",
+        "STATUS_CANCELED",
+        "STATUS_CANCELLED",
+    ]
+
+    static func verify(status: ESPNEventStatus?, plays: [ESPNPlay]) -> Bool {
+        guard let status else { return false }
+
+        let state = status.type.state?.lowercased() ?? ""
+        let statusName = status.type.name.uppercased()
+
+        if state == "pre" || preGameStatusNames.contains(statusName) {
+            return false
+        }
+
+        if status.type.completed == true || state == "post" || statusName == "STATUS_FINAL" {
+            return plays.contains(where: isSubstantivePlay)
+        }
+
+        let substantivePlays = plays.filter(isSubstantivePlay)
+        guard !substantivePlays.isEmpty else { return false }
+
+        if substantivePlays.contains(where: indicatesKickoffOrLiveAction) {
+            return true
+        }
+
+        if substantivePlays.contains(where: hasWallclock) {
+            return true
+        }
+
+        if state == "in" || statusName == "STATUS_IN_PROGRESS" {
+            return true
+        }
+
+        return false
+    }
+
+    private static func isSubstantivePlay(_ play: ESPNPlay) -> Bool {
+        let text = normalizedPlayText(play)
+        guard text.count >= 3 else { return false }
+        if preMatchFluffKeywords.contains(where: { text.contains($0) }) { return false }
+        return true
+    }
+
+    private static func indicatesKickoffOrLiveAction(_ play: ESPNPlay) -> Bool {
+        let text = normalizedPlayText(play)
+        return kickoffKeywords.contains { text.contains($0) }
+    }
+
+    private static func hasWallclock(_ play: ESPNPlay) -> Bool {
+        guard let wallclock = play.wallclock?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return false
+        }
+        return !wallclock.isEmpty
+    }
+
+    private static func normalizedPlayText(_ play: ESPNPlay) -> String {
+        [play.text, play.type?.text, play.type?.abbreviation]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+}
+
 // MARK: - Break Classification
 
 private enum ESPNBreakClassifier {
@@ -202,6 +291,13 @@ private enum ESPNBreakClassifier {
     }
 }
 
+// MARK: - Timeline Calibration (Hue Entertainment Area Latency)
+
+/// Persistent Hue-style stream lag offset — mirrors `@AppStorage("user_stream_delay")`.
+enum TimelineCalibrationStorage {
+    static let userStreamDelayKey = "user_stream_delay"
+}
+
 // MARK: - SportsAPIService
 
 @MainActor
@@ -209,29 +305,29 @@ final class SportsAPIService: ObservableObject {
 
     // MARK: Published State
 
-    /// Global broadcast lag — bound directly to Settings slider and highlight rewind math.
+    /// Hue Entertainment Area latency offset — bound to Settings slider & highlight rewind math.
+    /// Persisted under `TimelineCalibrationStorage.userStreamDelayKey` (`user_stream_delay`).
     @Published var streamDelaySeconds: Double = 0.0 {
         didSet {
-            persistStreamDelaySeconds()
+            applyTimelineCalibrationOffset()
         }
     }
 
-    /// Settings Hue-sync slider range (seconds behind live ESPN).
-    static let settingsSliderDelayRange: ClosedRange<Double> = 0...60
+    /// TV offset: negative = TV ahead of ESPN, positive = TV behind, zero = matched.
+    static let settingsSliderDelayRange: ClosedRange<Double> = -300...600
     static let settingsSliderStep: Double = 1.0
 
     /// SwiftUI binding surface — mirrors `gameID`.
-    @Published var monitoredGameID: String = "401547417" {
+    @Published var monitoredGameID: String = "" {
         didSet {
             gameID = monitoredGameID.trimmingCharacters(in: .whitespacesAndNewlines)
             UserDefaults.standard.set(gameID, forKey: SportsAPIStorageKey.monitoredGameID)
         }
     }
 
-    @Published var monitoredSportPath: String = "football/nfl" {
+    @Published var monitoredSportPath: String = "" {
         didSet {
-            let trimmed = monitoredSportPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            sportPath = trimmed.isEmpty ? "football/nfl" : trimmed
+            sportPath = monitoredSportPath.trimmingCharacters(in: .whitespacesAndNewlines)
             UserDefaults.standard.set(sportPath, forKey: SportsAPIStorageKey.monitoredSportPath)
         }
     }
@@ -265,6 +361,22 @@ final class SportsAPIService: ObservableObject {
     @Published private(set) var isTrackedGameLive: Bool = false
     @Published private(set) var latestESPNPlayLabel: String = ""
 
+    static let kickoffWaitClockDisplay = "00:00"
+    static let kickoffWaitBanner = "Waiting for kickoff…"
+
+    /// UI + sync gate — `true` only after ESPN play log confirms real kickoff.
+    @Published private(set) var isMatchPhysicallyActive: Bool = false
+
+    /// VOD / replay / finished — no live tick; user sets `streamDelaySeconds` only.
+    var isReplayOffsetMode: Bool {
+        hasMonitoredGame && !isTrackedGameLive
+    }
+
+    /// Live (post-kickoff) or replay offset calibration.
+    var allowsStreamOffsetCalibration: Bool {
+        isReplayOffsetMode || (isTrackedGameLive && isMatchPhysicallyActive)
+    }
+
     /// When on, ESPN stoppages + cloud `ad_start` trigger the skip macro automatically.
     @Published var isHandsFreeAutomationEnabled: Bool = true {
         didSet {
@@ -282,13 +394,14 @@ final class SportsAPIService: ObservableObject {
     // MARK: Spec State
 
     private var hasTriggeredThisBreak = false
-    private var gameID: String = "401547417"
-    private var sportPath: String = "football/nfl"
+    private var gameID: String = ""
+    private var sportPath: String = ""
 
     // MARK: Private
 
     private weak var tvController: TVController?
     private var pollingTimer: Timer?
+    private var matchClockUITimer: Timer?
     private let pollIntervalSeconds: TimeInterval = 4
     /// Typical NFL timeout / ad-pod length on linear TV — fallback when no plays parse.
     private let commercialBreakSeconds: Double = 150
@@ -298,6 +411,13 @@ final class SportsAPIService: ObservableObject {
     private let maxHighlightSkipSeconds = 210
     private var lastBreakPlayID: String?
     private var scheduledReturnToLiveTask: Task<Void, Never>?
+    /// ESPN game-time base — elapsed seconds in the match when `matchElapsedBaseCapturedAt` was set.
+    private var matchElapsedBaseSeconds: Int = 0
+    private var matchElapsedBaseCapturedAt: Date?
+    /// Paused only during ESPN stoppages (halftime, timeout) — not during normal live play.
+    private var isMatchClockPaused: Bool = false
+    /// Blocks ESPN from re-anchoring elapsed time while the user is tuning TV offset.
+    private var offsetCalibrationHoldUntil: Date?
     @Published private(set) var pendingAutoGoLive = false
     /// Seconds to watch the highlight after the skip macro — longer for big plays.
     private let baseHighlightWatchSeconds: TimeInterval = 45
@@ -317,18 +437,26 @@ final class SportsAPIService: ObservableObject {
     // MARK: Init
 
     init() {
-        streamDelaySeconds = UserDefaults.standard.object(
+        if let calibrated = UserDefaults.standard.object(
+            forKey: TimelineCalibrationStorage.userStreamDelayKey
+        ) as? Double {
+            streamDelaySeconds = calibrated
+        } else if let legacy = UserDefaults.standard.object(
             forKey: SportsAPIStorageKey.streamDelaySeconds
-        ) as? Double ?? 0.0
+        ) as? Double {
+            streamDelaySeconds = legacy
+            UserDefaults.standard.set(legacy, forKey: TimelineCalibrationStorage.userStreamDelayKey)
+        }
 
         hasSyncedStreamLag = UserDefaults.standard.bool(forKey: SportsAPIStorageKey.hasSyncedStreamLag)
+            || streamDelaySeconds != 0
 
         let storedGameID = UserDefaults.standard.string(forKey: SportsAPIStorageKey.monitoredGameID) ?? ""
         gameID = storedGameID.trimmingCharacters(in: .whitespacesAndNewlines)
         monitoredGameID = gameID
 
         let storedSportPath = UserDefaults.standard.string(forKey: SportsAPIStorageKey.monitoredSportPath)
-        sportPath = (storedSportPath?.isEmpty == false) ? storedSportPath! : "football/nfl"
+        sportPath = (storedSportPath?.isEmpty == false) ? storedSportPath! : ""
         monitoredSportPath = sportPath
 
         monitoredGameLabel = UserDefaults.standard.string(forKey: SportsAPIStorageKey.monitoredGameLabel) ?? ""
@@ -344,10 +472,17 @@ final class SportsAPIService: ObservableObject {
                 forKey: SportsAPIStorageKey.autoReturnToLiveAfterHighlight
             )
         }
+
+        if UserDefaults.standard.object(forKey: SportsAPIStorageKey.monitoredGameIsLive) != nil {
+            isTrackedGameLive = UserDefaults.standard.bool(forKey: SportsAPIStorageKey.monitoredGameIsLive)
+        }
+
+        restoreMatchElapsedClockIfNeeded()
     }
 
     deinit {
         pollingTimer?.invalidate()
+        matchClockUITimer?.invalidate()
     }
 
     // MARK: - Rewind Target
@@ -381,7 +516,7 @@ final class SportsAPIService: ObservableObject {
             let results = try await ESPNGameSearchService.search(query: trimmed)
             gameSearchResults = results
             gameSearchStatus = results.isEmpty
-                ? "No games found — try just \"Argentina\" or \"Chiefs\""
+                ? "No games found — try a team (Argentina) or league (Premier League)"
                 : "Found \(results.count) game(s) — tap one to track"
         } catch {
             gameSearchResults = []
@@ -397,7 +532,7 @@ final class SportsAPIService: ObservableObject {
         let results = await ESPNGameSearchService.liveGamesToday()
         gameSearchResults = results
         gameSearchStatus = results.isEmpty
-            ? "No live games right now — search by team name"
+            ? "No live games right now — search by team or league"
             : "Live now — tap a game to track"
     }
 
@@ -409,62 +544,399 @@ final class SportsAPIService: ObservableObject {
         gameSearchStatus = "Tracking \(result.title)"
         lastStatusSummary = "Now tracking \(result.title)"
         appendActivity("Selected game — \(result.title)")
+
+        tickingGameClock = nil
+        liveGameClock = nil
+        clearMatchElapsedClock()
+        isMatchPhysicallyActive = false
+        offsetCalibrationHoldUntil = nil
+        isTrackedGameLive = result.isLive
+        UserDefaults.standard.set(result.isLive, forKey: SportsAPIStorageKey.monitoredGameIsLive)
+        liveGameClockLabel = result.isLive ? Self.kickoffWaitClockDisplay : "Replay"
+        hasSyncedStreamLag = streamDelaySeconds != 0
+
+        stopGamePolling()
+        startGamePolling()
     }
 
-    // MARK: - Automated Delay Sync
+    // MARK: - Match Elapsed Clock (synced to ESPN game time, ticks locally)
 
-    // MARK: - Stream Lag Sync (Hue-style game clock)
+    /// Anchor for 1 Hz UI ticks — aligned to when ESPN game time was last seeded.
+    var matchClockTickAnchor: Date? {
+        guard isMatchPhysicallyActive else { return nil }
+        return matchElapsedBaseCapturedAt
+    }
+
+    private static func alignedToWholeSecond(_ date: Date) -> Date {
+        Date(timeIntervalSince1970: floor(date.timeIntervalSince1970))
+    }
+
+    /// Seconds elapsed in the match per ESPN — ticks every second during live play.
+    func espnElapsedSeconds(at date: Date = Date()) -> Int? {
+        guard isMatchPhysicallyActive, let capturedAt = matchElapsedBaseCapturedAt else { return nil }
+        if isMatchClockPaused {
+            return max(0, matchElapsedBaseSeconds)
+        }
+        let delta = Int(floor(date.timeIntervalSince(capturedAt)))
+        return max(0, matchElapsedBaseSeconds + delta)
+    }
+
+    /// TV timeline = ESPN elapsed minus user offset (negative offset = TV ahead).
+    func tvElapsedSeconds(at date: Date = Date()) -> Int? {
+        guard espnElapsedSeconds(at: date) != nil else { return nil }
+        return max(0, rawTvElapsedSeconds(at: date))
+    }
+
+    /// Unclamped TV elapsed — used for nudge bounds.
+    func rawTvElapsedSeconds(at date: Date = Date()) -> Int {
+        guard let elapsed = espnElapsedSeconds(at: date) else { return 0 }
+        return elapsed - Int(streamDelaySeconds.rounded())
+    }
+
+    /// Moves the TV match clock +/− without touching ESPN. +1 raises TV, −1 lowers TV.
+    func nudgeTVClockDisplay(by seconds: Int, at date: Date = Date()) {
+        guard seconds != 0 else { return }
+        nudgeStreamDelay(by: -seconds)
+    }
+
+    func canNudgeTVClockDisplay(by seconds: Int, at date: Date = Date()) -> Bool {
+        guard seconds != 0, allowsStreamOffsetCalibration else { return false }
+        guard canNudgeStreamDelay(by: -seconds) else { return false }
+        if seconds < 0 {
+            let tv = rawTvElapsedSeconds(at: date)
+            return tv > 0 && tv + seconds >= 0
+        }
+        return true
+    }
+
+    private func formatElapsedClock(_ seconds: Int) -> String {
+        GameClockSyncEngine.formatMatchClock(seconds: seconds)
+    }
+
+    /// One-shot scoreboard fetch — seeds match clock from ESPN's live game time.
+    func bootstrapClockFromScoreboard() async {
+        guard hasMonitoredGame else {
+            liveGameClockLabel = "Choose a game first"
+            return
+        }
+        if isReplayOffsetMode {
+            liveGameClockLabel = "Replay"
+            return
+        }
+        await syncMatchClockFromScoreboard(force: true)
+        if isMatchPhysicallyActive {
+            liveGameClockLabel = espnAPIClockDisplay()
+        } else {
+            liveGameClockLabel = Self.kickoffWaitClockDisplay
+        }
+    }
+
+    func resyncClockFromScoreboard() async {
+        await bootstrapClockFromScoreboard()
+    }
+
+    private func restoreMatchElapsedClockIfNeeded() {
+        guard hasMonitoredGame else { return }
+        let persistedID = UserDefaults.standard.string(forKey: SportsAPIStorageKey.matchClockGameID) ?? ""
+        guard persistedID == gameID else { return }
+
+        let capturedTS = UserDefaults.standard.double(forKey: SportsAPIStorageKey.matchElapsedBaseCapturedAt)
+        guard capturedTS > 0 else { return }
+
+        matchElapsedBaseSeconds = UserDefaults.standard.integer(
+            forKey: SportsAPIStorageKey.matchElapsedBaseSeconds
+        )
+        matchElapsedBaseCapturedAt = Date(timeIntervalSince1970: capturedTS)
+        isMatchClockPaused = false
+
+        guard isTrackedGameLive else { return }
+        isMatchPhysicallyActive = true
+        liveGameClockLabel = formatElapsedClock(espnElapsedSeconds() ?? matchElapsedBaseSeconds)
+        startMatchClockUITimer()
+    }
+
+    private func persistMatchElapsedClock() {
+        guard hasMonitoredGame, let capturedAt = matchElapsedBaseCapturedAt else { return }
+        UserDefaults.standard.set(matchElapsedBaseSeconds, forKey: SportsAPIStorageKey.matchElapsedBaseSeconds)
+        UserDefaults.standard.set(capturedAt.timeIntervalSince1970, forKey: SportsAPIStorageKey.matchElapsedBaseCapturedAt)
+        UserDefaults.standard.set(gameID, forKey: SportsAPIStorageKey.matchClockGameID)
+    }
+
+    private func clearMatchElapsedClock() {
+        matchElapsedBaseSeconds = 0
+        matchElapsedBaseCapturedAt = nil
+        isMatchClockPaused = false
+        stopMatchClockUITimer()
+        UserDefaults.standard.removeObject(forKey: SportsAPIStorageKey.matchElapsedBaseSeconds)
+        UserDefaults.standard.removeObject(forKey: SportsAPIStorageKey.matchElapsedBaseCapturedAt)
+        UserDefaults.standard.removeObject(forKey: SportsAPIStorageKey.matchClockGameID)
+    }
+
+    private func startMatchClockUITimer() {
+        stopMatchClockUITimer()
+        guard isMatchPhysicallyActive, matchElapsedBaseCapturedAt != nil else { return }
+
+        matchClockUITimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.tickMatchClockDisplay()
+            }
+        }
+        if let matchClockUITimer {
+            RunLoop.main.add(matchClockUITimer, forMode: .common)
+        }
+        tickMatchClockDisplay()
+    }
+
+    private func stopMatchClockUITimer() {
+        matchClockUITimer?.invalidate()
+        matchClockUITimer = nil
+    }
+
+    private func tickMatchClockDisplay() {
+        guard isMatchPhysicallyActive, !isReplayOffsetMode else {
+            stopMatchClockUITimer()
+            return
+        }
+        guard let elapsed = espnElapsedSeconds() else { return }
+        let label = formatElapsedClock(elapsed)
+        if liveGameClockLabel != label {
+            liveGameClockLabel = label
+        }
+    }
+
+    private func parseClock(from summary: ESPNSummaryResponse) -> ESPNGameClock? {
+        let status = summary.header?.competitions?.first?.status
+        return GameClockSyncEngine.parseClock(
+            period: status?.period,
+            clock: status?.clock,
+            displayClock: status?.displayClock,
+            state: status?.type.state,
+            sportPath: sportPath,
+            statusDetail: status?.type.detail ?? status?.type.shortDetail
+        )
+    }
+
+    private func applyESPNGameClock(
+        _ clock: ESPNGameClock,
+        source: String,
+        force: Bool = false,
+        paused: Bool = false
+    ) {
+        let espnElapsed = GameClockSyncEngine.elapsedGameSeconds(from: clock, sportPath: sportPath)
+        let now = Self.alignedToWholeSecond(Date())
+        isMatchClockPaused = paused
+        liveGameClock = clock
+
+        // User is tuning TV offset — keep local ESPN tick steady; only offset changes TV.
+        if !force, !paused,
+           let holdUntil = offsetCalibrationHoldUntil,
+           Date() < holdUntil,
+           matchElapsedBaseCapturedAt != nil {
+            if let elapsed = espnElapsedSeconds(at: now) {
+                liveGameClockLabel = formatElapsedClock(elapsed)
+            }
+            startMatchClockUITimer()
+            return
+        }
+
+        if paused {
+            matchElapsedBaseSeconds = espnElapsed
+            matchElapsedBaseCapturedAt = now
+            liveGameClockLabel = formatElapsedClock(espnElapsed)
+            persistMatchElapsedClock()
+            stopMatchClockUITimer()
+            return
+        }
+
+        // Initial seed or forced resync only — never drift-correct during live play.
+        guard force || matchElapsedBaseCapturedAt == nil else {
+            startMatchClockUITimer()
+            if let elapsed = espnElapsedSeconds(at: now) {
+                liveGameClockLabel = formatElapsedClock(elapsed)
+            }
+            return
+        }
+
+        matchElapsedBaseSeconds = espnElapsed
+        matchElapsedBaseCapturedAt = now
+        liveGameClockLabel = formatElapsedClock(espnElapsed)
+        persistMatchElapsedClock()
+        startMatchClockUITimer()
+        appendActivity("Match clock from ESPN (\(source)) — \(formatElapsedClock(espnElapsed))")
+    }
+
+    private func syncMatchClockFromScoreboard(force: Bool = false, paused: Bool = false) async {
+        guard hasMonitoredGame, !isReplayOffsetMode else { return }
+        do {
+            if let clock = try await ESPNScoreboardClockService.fetchClock(
+                eventID: gameID,
+                sportPath: sportPath
+            ) {
+                applyESPNGameClock(clock, source: "scoreboard", force: force, paused: paused)
+            }
+        } catch {
+            print("⚠️ SportsAPIService: scoreboard clock sync failed — \(error.localizedDescription)")
+        }
+    }
+
+    private func syncMatchClockFromSummary(
+        _ summary: ESPNSummaryResponse,
+        force: Bool = false,
+        paused: Bool = false
+    ) {
+        guard hasMonitoredGame, !isReplayOffsetMode else { return }
+        guard let clock = parseClock(from: summary) else { return }
+        applyESPNGameClock(clock, source: "summary", force: force, paused: paused)
+    }
+
+    private func beginKickoffElapsedClockFallback() {
+        let now = Self.alignedToWholeSecond(Date())
+        matchElapsedBaseSeconds = 0
+        matchElapsedBaseCapturedAt = now
+        isMatchClockPaused = false
+        liveGameClockLabel = formatElapsedClock(0)
+        persistMatchElapsedClock()
+        startMatchClockUITimer()
+        appendActivity("Kickoff — clock 00:00 (ESPN seed unavailable)")
+        markStreamLagSynced()
+    }
+
+    /// Fine-tunes TV offset (± seconds). Negative = TV ahead of ESPN.
+    func nudgeStreamDelay(by seconds: Int) {
+        guard allowsStreamOffsetCalibration, seconds != 0 else { return }
+        let current = Int(streamDelaySeconds.rounded())
+        let next = current + seconds
+        let lower = Int(Self.settingsSliderDelayRange.lowerBound)
+        let upper = Int(Self.settingsSliderDelayRange.upperBound)
+        streamDelaySeconds = Double(min(upper, max(lower, next)))
+        markOffsetCalibrationInProgress()
+        markStreamLagSynced()
+    }
+
+    private func markOffsetCalibrationInProgress() {
+        offsetCalibrationHoldUntil = Date().addingTimeInterval(30)
+    }
+
+    func canNudgeStreamDelay(by seconds: Int) -> Bool {
+        guard allowsStreamOffsetCalibration, seconds != 0 else { return false }
+        let current = Int(streamDelaySeconds.rounded())
+        let next = current + seconds
+        return next >= Int(Self.settingsSliderDelayRange.lowerBound)
+            && next <= Int(Self.settingsSliderDelayRange.upperBound)
+    }
+
+    static func formatStreamDelayOffset(_ seconds: Double) -> String {
+        let value = Int(seconds.rounded())
+        if value > 0 { return "+\(value)s" }
+        if value < 0 { return "\(value)s" }
+        return "0s"
+    }
+
+    var streamDelayOffsetLabel: String {
+        Self.formatStreamDelayOffset(streamDelaySeconds)
+    }
+
+    /// Universal highlight rewind from an ESPN ISO-8601 wallclock + `streamDelaySeconds`.
+    func calculatedRewindSeconds(for highlight: SportHighlight, now: Date = Date()) -> Int {
+        SportHighlightEngine.finalRewindSeconds(
+            highlightDate: highlight.apiTimestamp,
+            streamDelaySeconds: streamDelaySeconds,
+            now: now
+        )
+    }
+
+    private func applyScoreboardClock(_ clock: ESPNGameClock) {
+        applyESPNGameClock(clock, source: "scoreboard", force: true)
+    }
+
+    // MARK: - Stream Lag Sync
 
     /// User matched the +/- clock to their TV — offset is the broadcast delay.
     func confirmStreamDelay(_ delaySeconds: Int) {
-        let clamped = max(0, min(delaySeconds, GameClockSyncEngine.maxBroadcastDelaySeconds))
+        let clamped = max(
+            Int(Self.settingsSliderDelayRange.lowerBound),
+            min(delaySeconds, Int(Self.settingsSliderDelayRange.upperBound))
+        )
         applyStreamDelaySync(Double(clamped), method: "matched TV clock")
     }
 
-    func espnClockDisplay(at date: Date = Date()) -> String? {
-        espnLiveClockDisplay(at: date)
+    // MARK: - Clock Display (elapsed 00:00 + TV delay offset)
+
+    /// ESPN elapsed match clock — zero delay, ticks from kickoff.
+    func espnAPIClockDisplay(at date: Date = Date()) -> String {
+        if isReplayOffsetMode {
+            return "Replay"
+        }
+        guard isMatchPhysicallyActive, let elapsed = espnElapsedSeconds(at: date) else {
+            return Self.kickoffWaitClockDisplay
+        }
+        return formatElapsedClock(elapsed)
     }
 
-    /// True live game clock from ESPN — zero broadcast delay.
+    /// What your TV should show — ESPN elapsed minus `streamDelaySeconds`.
+    func calibratedTVTimelineDisplay(at date: Date = Date()) -> String {
+        if isReplayOffsetMode {
+            return Self.formatStreamDelayOffset(streamDelaySeconds)
+        }
+        guard isMatchPhysicallyActive, let tvSeconds = tvElapsedSeconds(at: date) else {
+            return Self.kickoffWaitClockDisplay
+        }
+        return formatElapsedClock(tvSeconds)
+    }
+
+    func espnClockDisplay(at date: Date = Date()) -> String? {
+        espnAPIClockDisplay(at: date)
+    }
+
     func espnLiveClockDisplay(at date: Date = Date()) -> String? {
-        tickingGameClock?.liveDisplay(at: date)
+        guard isMatchPhysicallyActive else { return nil }
+        return espnAPIClockDisplay(at: date)
     }
 
     func espnElapsedHint(at date: Date = Date()) -> String? {
-        guard let ticker = tickingGameClock else { return nil }
-        let clock = ticker.liveClock(at: date)
-        return GameClockSyncEngine.elapsedMinutesLabel(from: clock, sportPath: sportPath)
+        guard let elapsed = espnElapsedSeconds(at: date) else { return nil }
+        return "\(formatElapsedClock(elapsed)) elapsed"
     }
 
-    /// Game clock shifted by broadcast delay — what your TV feed shows.
     func broadcastGameClockDisplay(delaySeconds: Int, at date: Date = Date()) -> String? {
-        tickingGameClock?.tvDisplay(delaySeconds: delaySeconds, at: date)
+        guard isMatchPhysicallyActive, let elapsed = espnElapsedSeconds(at: date) else { return nil }
+        let tvSeconds = max(0, Int(floor(Double(elapsed) - Double(delaySeconds))))
+        return formatElapsedClock(tvSeconds)
     }
 
     func tvClockDisplay(delaySeconds: Int, at date: Date = Date()) -> String? {
         broadcastGameClockDisplay(delaySeconds: delaySeconds, at: date)
     }
 
-    /// Home / settings: after sync, show the delayed clock (matches TV); before sync, ESPN live.
     func uiGameClockDisplay(at date: Date = Date()) -> String {
-        syncedTimelineClockDisplay(at: date)
+        calibratedTVTimelineDisplay(at: date)
     }
 
-    /// App timeline for Hue-style sync — shifts with `streamDelaySeconds` as the slider moves.
     func syncedTimelineClockDisplay(at date: Date = Date()) -> String {
-        let delay = Int(streamDelaySeconds.rounded())
-        if delay > 0, let broadcast = broadcastGameClockDisplay(delaySeconds: delay, at: date) {
-            return broadcast
-        }
-        if let live = espnLiveClockDisplay(at: date) {
-            return live
-        }
-        return liveGameClockLabel
+        calibratedTVTimelineDisplay(at: date)
     }
 
-    /// Formatted offset readout for the Settings delay panel.
-    var streamOffsetReadout: String {
-        "Current Stream Offset: \(Int(streamDelaySeconds.rounded())) seconds behind real-time broadcast."
+    var streamingLagOffsetReadout: String {
+        let seconds = Int(streamDelaySeconds.rounded())
+        if isReplayOffsetMode {
+            if seconds > 0 {
+                return "Replay: TV is \(seconds)s behind ESPN on highlight rewinds."
+            }
+            if seconds < 0 {
+                return "Replay: TV is \(-seconds)s ahead of ESPN on highlight rewinds."
+            }
+            return "Set offset — + if TV is behind, − if TV is ahead."
+        }
+        guard isMatchPhysicallyActive else {
+            return Self.kickoffWaitBanner
+        }
+        if seconds > 0 {
+            return "TV is \(seconds)s behind ESPN. Tap + if TV is slower, − if TV is ahead."
+        }
+        if seconds < 0 {
+            return "TV is \(-seconds)s ahead of ESPN. Tap − to raise the TV clock."
+        }
+        return "Tap + if your TV is behind, − if your TV is ahead."
     }
 
     /// User's TV timeline — when a live ESPN moment appears on their screen.
@@ -477,8 +949,9 @@ final class SportsAPIService: ObservableObject {
 
     private func applyStreamDelaySync(_ delay: Double, method: String) {
         streamDelaySeconds = delay
-        lastStatusSummary = "Synced — TV is \(Int(delay.rounded()))s behind ESPN live"
-        appendActivity("Lag synced via \(method) — \(Int(delay.rounded()))s")
+        let label = Self.formatStreamDelayOffset(delay)
+        lastStatusSummary = "Synced — TV offset \(label)"
+        appendActivity("Lag synced via \(method) — \(label)")
 
         print("📡 SportsAPIService: streamDelaySeconds = \(delay)s (\(method))")
 
@@ -490,13 +963,31 @@ final class SportsAPIService: ObservableObject {
         }
     }
 
-    private func persistStreamDelaySeconds() {
-        UserDefaults.standard.set(streamDelaySeconds, forKey: SportsAPIStorageKey.streamDelaySeconds)
-        let isSynced = streamDelaySeconds > 0
-        if hasSyncedStreamLag != isSynced {
-            hasSyncedStreamLag = isSynced
-            UserDefaults.standard.set(isSynced, forKey: SportsAPIStorageKey.hasSyncedStreamLag)
+    /// Persists Hue latency offset and marks calibration active for highlight rewind math.
+    private func applyTimelineCalibrationOffset() {
+        let clamped = min(
+            max(Self.settingsSliderDelayRange.lowerBound, streamDelaySeconds.rounded()),
+            Self.settingsSliderDelayRange.upperBound
+        )
+        if clamped != streamDelaySeconds {
+            streamDelaySeconds = clamped
+            return
         }
+
+        UserDefaults.standard.set(streamDelaySeconds, forKey: TimelineCalibrationStorage.userStreamDelayKey)
+        UserDefaults.standard.set(streamDelaySeconds, forKey: SportsAPIStorageKey.streamDelaySeconds)
+    }
+
+    private func markStreamLagSynced() {
+        guard allowsStreamOffsetCalibration, !hasSyncedStreamLag else { return }
+        hasSyncedStreamLag = true
+        UserDefaults.standard.set(true, forKey: SportsAPIStorageKey.hasSyncedStreamLag)
+    }
+
+    /// Call after slider or ± adjusts delay so highlight rewind can run.
+    func acknowledgeStreamDelayCalibration() {
+        markOffsetCalibrationInProgress()
+        markStreamLagSynced()
     }
 
     /// Legacy fallback — estimates lag from the latest play wallclock.
@@ -568,12 +1059,19 @@ final class SportsAPIService: ObservableObject {
     /// Starts ESPN polling — requires a chosen game ID.
     func startGamePolling() {
         let trimmedID = gameID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedPath = sportPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedID.isEmpty else {
             monitoringStatus = .idle
             lastStatusSummary = "Choose a game to start ESPN monitoring"
             return
         }
+        guard !trimmedPath.isEmpty else {
+            monitoringStatus = .idle
+            lastStatusSummary = "Choose a game — ESPN sport path missing"
+            return
+        }
         gameID = trimmedID
+        sportPath = trimmedPath
 
         stopGamePolling()
 
@@ -593,7 +1091,15 @@ final class SportsAPIService: ObservableObject {
             RunLoop.main.add(pollingTimer, forMode: .common)
         }
 
-        Task { await pollGameSummary() }
+        Task {
+            if isTrackedGameLive, let elapsed = espnElapsedSeconds() {
+                liveGameClockLabel = formatElapsedClock(elapsed)
+            }
+            await pollGameSummary()
+            if isTrackedGameLive, isMatchPhysicallyActive, matchElapsedBaseCapturedAt == nil {
+                await syncMatchClockFromScoreboard(force: true)
+            }
+        }
     }
 
     func stopGamePolling() {
@@ -667,21 +1173,98 @@ final class SportsAPIService: ObservableObject {
 
     // MARK: - Evaluation
 
+    /// Confirms real kickoff via ESPN play log — blocks ghost pre-game clocks.
+    private func refreshKickoffVerification(from summary: ESPNSummaryResponse) async {
+        if isReplayOffsetMode || Self.isGameFinished(summary) {
+            isMatchPhysicallyActive = false
+            clearMatchElapsedClock()
+            tickingGameClock = nil
+            liveGameClock = nil
+            liveGameClockLabel = isReplayOffsetMode ? "Replay" : Self.kickoffWaitClockDisplay
+            return
+        }
+
+        let wasActive = isMatchPhysicallyActive
+        let plays = allPlays(from: summary)
+        let status = summary.header?.competitions?.first?.status
+        let verified = KickoffVerificationGate.verify(status: status, plays: plays)
+
+        isMatchPhysicallyActive = verified
+
+        guard verified else {
+            clearMatchElapsedClock()
+            liveGameClockLabel = Self.kickoffWaitClockDisplay
+            tickingGameClock = nil
+            liveGameClock = nil
+            if hasSyncedStreamLag {
+                hasSyncedStreamLag = false
+                UserDefaults.standard.set(false, forKey: SportsAPIStorageKey.hasSyncedStreamLag)
+            }
+            if isTrackedGameLive {
+                lastStatusSummary = Self.kickoffWaitBanner
+            }
+            return
+        }
+
+        if !wasActive {
+            lastStatusSummary = "Kickoff — loading match clock from ESPN"
+            markStreamLagSynced()
+        } else {
+            startMatchClockUITimer()
+            if let elapsed = espnElapsedSeconds() {
+                liveGameClockLabel = formatElapsedClock(elapsed)
+            }
+        }
+    }
+
+    private func reconcileLiveMatchClock(from summary: ESPNSummaryResponse, paused: Bool) async {
+        guard isMatchPhysicallyActive, isTrackedGameLive, !isReplayOffsetMode else { return }
+
+        let wasPaused = isMatchClockPaused
+
+        if matchElapsedBaseCapturedAt == nil {
+            await syncMatchClockFromScoreboard(force: true, paused: paused)
+            if matchElapsedBaseCapturedAt == nil {
+                syncMatchClockFromSummary(summary, force: true, paused: paused)
+            }
+            if matchElapsedBaseCapturedAt == nil {
+                beginKickoffElapsedClockFallback()
+            }
+            return
+        }
+
+        if paused {
+            syncMatchClockFromSummary(summary, force: true, paused: true)
+        } else if wasPaused {
+            syncMatchClockFromSummary(summary, force: true, paused: false)
+        } else {
+            startMatchClockUITimer()
+            if let elapsed = espnElapsedSeconds() {
+                liveGameClockLabel = formatElapsedClock(elapsed)
+            }
+        }
+    }
+
     private func evaluateSummary(_ summary: ESPNSummaryResponse) async {
         lastProcessedAt = Date()
         monitoringStatus = .monitoring
         isTrackedGameLive = Self.isGameLive(summary)
-        refreshLiveGameClock(from: summary)
-        _ = refreshRankedHighlightCounters(from: summary)
+        UserDefaults.standard.set(isTrackedGameLive, forKey: SportsAPIStorageKey.monitoredGameIsLive)
 
         let status = summary.header?.competitions?.first?.status
         let latestPlay = extractLatestPlay(from: summary)
+        let clockPaused = ESPNBreakClassifier.isCommercialBreak(status: status, latestPlay: latestPlay)
+
+        await refreshKickoffVerification(from: summary)
+        await reconcileLiveMatchClock(from: summary, paused: clockPaused)
+        _ = refreshRankedHighlightCounters(from: summary)
+
         if let text = latestPlay?.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
             latestESPNPlayLabel = text
         }
         let statusLabel = status?.type.description ?? status?.type.name ?? latestPlay?.text ?? "Unknown"
 
-        if ESPNBreakClassifier.isCommercialBreak(status: status, latestPlay: latestPlay) {
+        if clockPaused {
             lastBreakPlayID = latestPlay?.id
             isBreakActive = true
             if isHandsFreeAutomationEnabled {
@@ -741,8 +1324,10 @@ final class SportsAPIService: ObservableObject {
         guard !hasTriggeredThisBreak, !isCommercialBreakLoopActive else { return }
         guard let tvController else { return }
 
-        guard hasSyncedStreamLag else {
-            lastStatusSummary = "Match TV clock first — then hands-free can skip"
+        guard hasSyncedStreamLag, allowsStreamOffsetCalibration else {
+            lastStatusSummary = allowsStreamOffsetCalibration
+                ? "Set TV delay (+seconds) — then hands-free can skip"
+                : Self.kickoffWaitBanner
             return
         }
 
@@ -781,7 +1366,6 @@ final class SportsAPIService: ObservableObject {
     private func resolveAdSkipRewindSeconds() async -> Int {
         var selectedHighlight: SportHighlight?
         if let summary = try? await fetchGameSummary() {
-            refreshLiveGameClock(from: summary)
             isTrackedGameLive = Self.isGameLive(summary)
 
             if Self.isGameFinished(summary) {
@@ -880,12 +1464,6 @@ final class SportsAPIService: ObservableObject {
         }
 
         await tvController.fetchActiveAppID()
-
-        if commercialBreakPlaylist.count >= 2, hasSyncedStreamLag {
-            await runCommercialBreakHighlightLoop(source: source)
-            return
-        }
-
         await executeSingleHighlightSkip(rewindSeconds: rewindSeconds, source: source)
     }
 
@@ -963,14 +1541,14 @@ final class SportsAPIService: ObservableObject {
                 self.lastHighlightTarget = highlight.playDescription
 
                 if index == 0 {
-                    let rewind = SportHighlightEngine.finalRewindSeconds(
-                        highlightDate: highlight.apiTimestamp,
-                        streamDelaySeconds: self.streamDelaySeconds
-                    )
+                    let rewind = self.calculatedRewindSeconds(for: highlight)
                     let capped = min(rewind, self.maxHighlightSkipSeconds)
-                    let snapped = tvController.snappedSkipSeconds(targetSeconds: capped)
-                    self.lastPlannedRewindSeconds = snapped
-                    guard tvController.triggerRewindMacro(targetSeconds: snapped) else {
+                    self.lastPlannedRewindSeconds = tvController.snappedSkipSeconds(targetSeconds: capped)
+                    guard tvController.triggerRewindMacro(
+                        highlightDate: highlight.apiTimestamp,
+                        streamDelaySeconds: self.streamDelaySeconds,
+                        maxSeconds: capped
+                    ) else {
                         self.finishCommercialBreakLoop(success: false, message: tvController.statusMessage)
                         return
                     }
@@ -1102,7 +1680,7 @@ final class SportsAPIService: ObservableObject {
     // MARK: - Ranked Highlight Loop Engine
 
     func plannedHighlightRewindSeconds() async -> Int? {
-        guard hasSyncedStreamLag else { return nil }
+        guard hasSyncedStreamLag, allowsStreamOffsetCalibration else { return nil }
         guard let summary = try? await fetchGameSummary() else { return nil }
         return rankedHighlightRewindSeconds(from: summary)
     }
@@ -1113,12 +1691,13 @@ final class SportsAPIService: ObservableObject {
 
     /// Parses ESPN plays, ranks them, selects the top highlight, and computes precision rewind.
     private func rankedHighlightRewindSeconds(from summary: ESPNSummaryResponse) -> Int? {
-        guard hasSyncedStreamLag else { return nil }
+        guard hasSyncedStreamLag, allowsStreamOffsetCalibration else { return nil }
         guard let best = refreshRankedHighlightCounters(from: summary) else { return nil }
 
         print(
             "🎯 Ranked Highlight Loop: rank \(best.interestRank) \"\(best.playDescription)\" "
-            + "→ rewind \(lastPlannedRewindSeconds)s (pre=\(Int(SportHighlightEngine.prePlayPaddingSeconds))s, "
+            + "→ rewind \(lastPlannedRewindSeconds)s "
+            + "(lead=\(Int(TimelineOffsetEngine.rewindLeadSeconds))s, "
             + "lag=\(Int(streamDelaySeconds.rounded()))s)"
         )
 
@@ -1161,6 +1740,7 @@ final class SportsAPIService: ObservableObject {
         return best
     }
 
+    /// Fallback when scoreboard seed fails — summary API clock (not used during normal polling).
     private func refreshLiveGameClock(from summary: ESPNSummaryResponse) {
         let status = summary.header?.competitions?.first?.status
         let parsed = GameClockSyncEngine.parseClock(
@@ -1168,7 +1748,8 @@ final class SportsAPIService: ObservableObject {
             clock: status?.clock,
             displayClock: status?.displayClock,
             state: status?.type.state,
-            sportPath: sportPath
+            sportPath: sportPath,
+            statusDetail: status?.type.detail ?? status?.type.shortDetail
         )
         liveGameClock = parsed
 
@@ -1197,7 +1778,9 @@ final class SportsAPIService: ObservableObject {
         }
 
         // Keep local ticking between polls — only re-anchor when ESPN drifts or period changes.
-        if let existing = tickingGameClock, existing.mode == mode {
+        if let existing = tickingGameClock,
+           existing.mode == mode,
+           existing.sportPath == sportPath {
             let predicted = existing.liveClock(at: now)
             if predicted.period == clock.period {
                 let drift = abs(predicted.clockSeconds - clock.clockSeconds)
@@ -1321,6 +1904,10 @@ enum SportsAPIStorageKey {
     static let monitoredGameID = "zapremote.sports.monitoredGameID"
     static let monitoredSportPath = "zapremote.sports.monitoredSportPath"
     static let monitoredGameLabel = "zapremote.sports.monitoredGameLabel"
+    static let monitoredGameIsLive = "zapremote.sports.monitoredGameIsLive"
+    static let matchElapsedBaseSeconds = "zapremote.sports.matchElapsedBaseSeconds"
+    static let matchElapsedBaseCapturedAt = "zapremote.sports.matchElapsedBaseCapturedAt"
+    static let matchClockGameID = "zapremote.sports.matchClockGameID"
     static let hasSyncedStreamLag = "zapremote.sports.hasSyncedStreamLag"
     static let handsFreeAutomation = "zapremote.sports.handsFreeAutomation"
     static let autoReturnToLiveAfterHighlight = "zapremote.sports.autoReturnToLiveAfterHighlight"

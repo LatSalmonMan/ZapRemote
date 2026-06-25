@@ -14,6 +14,7 @@ private enum HomeSessionState: Equatable {
     case needsTV
     case pairingTV
     case needsGame
+    case waitingForKickoff
     case needsLagSync
     case watchingLive
     case commercialBreak
@@ -24,7 +25,8 @@ private enum HomeSessionState: Equatable {
         case .needsTV: "Connect your TV"
         case .pairingTV: "Approve on your TV"
         case .needsGame: "Choose tonight's game"
-        case .needsLagSync: "Match game clock"
+        case .waitingForKickoff: "Waiting for kickoff"
+        case .needsLagSync: "Set TV delay"
         case .watchingLive: "Hands-free armed"
         case .commercialBreak: "Skipping to highlights"
         case .attention(let message): message
@@ -39,8 +41,10 @@ private enum HomeSessionState: Equatable {
             "Accept the pairing prompt on the TV screen."
         case .needsGame:
             "Search ESPN for the game you're watching on TV."
+        case .waitingForKickoff:
+            "Clock starts at 00:00 when the ball is in play on your TV."
         case .needsLagSync:
-            "Match the ticking clock to your TV with + and −."
+            "Tap + or − until your TV clock matches."
         case .watchingLive:
             "Tap Ad on my TV when commercials start."
         case .commercialBreak:
@@ -100,6 +104,12 @@ struct RemoteView: View {
         if !sportsAPIService.hasMonitoredGame {
             return .needsGame
         }
+        if sportsAPIService.isReplayOffsetMode, !sportsAPIService.hasSyncedStreamLag {
+            return .needsLagSync
+        }
+        if sportsAPIService.isTrackedGameLive, !sportsAPIService.isMatchPhysicallyActive {
+            return .waitingForKickoff
+        }
         if !sportsAPIService.hasSyncedStreamLag {
             return .needsLagSync
         }
@@ -113,8 +123,12 @@ struct RemoteView: View {
         switch sessionState {
         case .watchingLive where sportsAPIService.isHandsFreeAutomationEnabled:
             return "Hands-free ON — halftime & TV timeouts auto-skip to ESPN highlights."
+        case .needsLagSync where sportsAPIService.isReplayOffsetMode:
+            return "Set how many seconds your replay is behind ESPN (+1 min, +10s, etc.)."
         case .needsLagSync:
-            return "ESPN shows live — tap Match Clock and line up YOUR TV with your screen."
+            return "ESPN ticks from 00:00 — add seconds until the TV line matches your screen."
+        case .waitingForKickoff:
+            return sessionState.heroSubtitle
         default:
             return sessionState.heroSubtitle
         }
@@ -194,29 +208,32 @@ struct RemoteView: View {
                         onResetTV: onResetTV
                     )
 
-                    TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                    TimelineView(.periodic(from: sportsAPIService.matchClockTickAnchor ?? Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970)), by: 1)) { timeline in
                         let now = timeline.date
                         HomeHeroCard(
                             theme: theme,
                             state: sessionState,
                             subtitle: heroSubtitleText,
                             streamingService: streamingService,
-                            streamDelaySeconds: sportsAPIService.streamDelaySeconds,
+                            streamDelayLabel: sportsAPIService.streamDelayOffsetLabel,
                             trackedGameLabel: sportsAPIService.monitoredGameLabel,
                             highlightRank: sportsAPIService.selectedHighlightRank,
                             plannedRewindSeconds: sportsAPIService.lastPlannedRewindSeconds,
                             espnLiveClockLabel: sportsAPIService.espnLiveClockDisplay(at: now)
                                 ?? sportsAPIService.liveGameClockLabel,
                             syncedGameClockLabel: sportsAPIService.uiGameClockDisplay(at: now),
+                            isReplayMode: sportsAPIService.isReplayOffsetMode,
                             onChangeGame: { isGameSearchPresented = true }
                         )
                     }
 
-                    HomeControlDeck(
+                        HomeControlDeck(
                         theme: theme,
                         isTVConnected: tvController.isConnected,
                         isMacroRunning: tvController.isMacroRunning,
-                        showSyncLag: sessionState == .needsLagSync,
+                        showSyncLag: sportsAPIService.hasMonitoredGame,
+                        syncLagTitle: sportsAPIService.isReplayOffsetMode ? "TV Delay" : "Match Clock",
+                        syncLagIcon: sportsAPIService.isReplayOffsetMode ? "timer" : "clock.badge.checkmark",
                         showChooseGame: sessionState == .needsGame,
                         onChooseGame: { isGameSearchPresented = true },
                         onSyncLag: {
@@ -271,7 +288,28 @@ struct RemoteView: View {
                 .preferredColorScheme(.dark)
         }
         .sheet(isPresented: $isClockSyncPresented) {
-            StreamClockSyncSheet(sportsAPIService: sportsAPIService)
+            NavigationStack {
+                ZStack {
+                    CouchModeScreenBackground(theme: theme, streamingAccent: streamingService.accent)
+                    ScrollView {
+                        TimelineSyncView(
+                            apiService: sportsAPIService,
+                            theme: theme,
+                            showsResyncButton: true
+                        )
+                        .padding(20)
+                    }
+                }
+                .navigationTitle(sportsAPIService.isReplayOffsetMode ? "TV Delay" : "Match Clock")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { isClockSyncPresented = false }
+                            .foregroundStyle(theme.accentPrimary)
+                    }
+                }
+            }
+            .preferredColorScheme(.dark)
         }
         .sheet(isPresented: $isExplainerPresented) {
             NavigationStack {
@@ -450,12 +488,13 @@ private struct HomeHeroCard: View {
     let state: HomeSessionState
     let subtitle: String
     let streamingService: StreamingServicePreference
-    let streamDelaySeconds: Double
+    let streamDelayLabel: String
     var trackedGameLabel: String = ""
     var highlightRank: Int = 0
     var plannedRewindSeconds: Int = 0
     var espnLiveClockLabel: String = "—"
     var syncedGameClockLabel: String = "—"
+    var isReplayMode: Bool = false
     var onChangeGame: (() -> Void)? = nil
 
     var body: some View {
@@ -507,14 +546,29 @@ private struct HomeHeroCard: View {
             }
             .buttonStyle(.plain)
 
-            if state == .watchingLive || state == .commercialBreak || state == .needsLagSync {
+            if state == .watchingLive || state == .commercialBreak || state == .needsLagSync || state == .waitingForKickoff {
                 HStack(spacing: 20) {
-                    if state == .needsLagSync, espnLiveClockLabel != "—" {
-                        heroFact(label: "ESPN live", value: espnLiveClockLabel)
+                    if state == .waitingForKickoff {
+                        heroFact(label: "Match clock", value: syncedGameClockLabel)
+                    }
+                    if state == .needsLagSync {
+                        if isReplayMode {
+                            heroFact(label: "TV offset", value: streamDelayLabel)
+                        } else {
+                            if espnLiveClockLabel != "—", espnLiveClockLabel != "Replay" {
+                                heroFact(label: "ESPN", value: espnLiveClockLabel)
+                            }
+                            heroFact(label: "Your TV", value: syncedGameClockLabel)
+                            heroFact(label: "Offset", value: streamDelayLabel)
+                        }
                     }
                     if state == .watchingLive || state == .commercialBreak {
-                        heroFact(label: "TV clock", value: syncedGameClockLabel)
-                        heroFact(label: "Lag", value: "\(Int(streamDelaySeconds.rounded()))s")
+                        if isReplayMode {
+                            heroFact(label: "TV offset", value: streamDelayLabel)
+                        } else {
+                            heroFact(label: "TV clock", value: syncedGameClockLabel)
+                            heroFact(label: "Offset", value: streamDelayLabel)
+                        }
                     }
                     if highlightRank > 0, state != .needsLagSync {
                         heroFact(label: "Rank", value: rankDisplay(highlightRank))
@@ -548,6 +602,10 @@ private struct HomeHeroCard: View {
             Image(systemName: "clock.badge.checkmark")
                 .font(.system(size: 32, weight: .semibold))
                 .foregroundStyle(theme.accentPrimary)
+        case .waitingForKickoff:
+            Image(systemName: "hourglass.circle.fill")
+                .font(.system(size: 32, weight: .semibold))
+                .foregroundStyle(theme.accentSecondary)
         case .needsGame:
             Image(systemName: "sportscourt")
                 .font(.system(size: 32, weight: .semibold))
@@ -590,6 +648,8 @@ private struct HomeControlDeck: View {
     let isTVConnected: Bool
     let isMacroRunning: Bool
     let showSyncLag: Bool
+    let syncLagTitle: String
+    let syncLagIcon: String
     let showChooseGame: Bool
     let onChooseGame: () -> Void
     let onSyncLag: () -> Void
@@ -613,8 +673,8 @@ private struct HomeControlDeck: View {
 
             if showSyncLag {
                 HomeControlButton(
-                    title: "Match Clock",
-                    systemImage: "clock.badge.checkmark",
+                    title: syncLagTitle,
+                    systemImage: syncLagIcon,
                     theme: theme,
                     isPrimary: true,
                     isEnabled: isTVConnected,

@@ -2,7 +2,7 @@
 //  ESPNGameSearch.swift
 //  ZapRemote
 //
-//  Natural-language-ish game lookup via ESPN search + live scoreboards.
+//  Game lookup via ESPN search + scoreboards (soccer-first).
 //
 
 import Foundation
@@ -12,10 +12,11 @@ import Foundation
 struct ESPNGameSearchResult: Identifiable, Equatable, Sendable {
     let id: String
     let eventID: String
-    /// e.g. `football/nfl` or `soccer/fifa.world`
+    /// e.g. `football/nfl` or `soccer/eng.1`
     let sportPath: String
     let title: String
     let statusLabel: String
+    let leagueLabel: String
     let isLive: Bool
 
     var selectionSummary: String {
@@ -33,40 +34,78 @@ enum ESPNGameSearchError: LocalizedError {
     }
 }
 
+// MARK: - Scoreboard registry
+
+private struct ScoreboardSpec: Sendable {
+    let sport: String
+    let league: String
+    let label: String
+}
+
 // MARK: - ESPNGameSearchService
 
 enum ESPNGameSearchService {
 
-    private static let featuredScoreboards: [(sport: String, league: String, label: String)] = [
-        ("football", "nfl", "NFL"),
-        ("soccer", "fifa.world", "FIFA World Cup"),
-        ("soccer", "usa.1", "MLS"),
-        ("basketball", "nba", "NBA"),
-        ("baseball", "mlb", "MLB"),
-        ("hockey", "nhl", "NHL"),
-        ("football", "college-football", "College Football"),
-        ("basketball", "mens-college-basketball", "Men's College Basketball"),
+    /// Soccer leagues searched first — most ZapRemote users watch football/soccer on TV.
+    private static let soccerScoreboards: [ScoreboardSpec] = [
+        ScoreboardSpec(sport: "soccer", league: "fifa.world", label: "FIFA World Cup"),
+        ScoreboardSpec(sport: "soccer", league: "fifa.worldq.conmebol", label: "WCQ CONMEBOL"),
+        ScoreboardSpec(sport: "soccer", league: "fifa.worldq.uefa", label: "WCQ UEFA"),
+        ScoreboardSpec(sport: "soccer", league: "fifa.worldq.concacaf", label: "WCQ Concacaf"),
+        ScoreboardSpec(sport: "soccer", league: "fifa.cwc", label: "Club World Cup"),
+        ScoreboardSpec(sport: "soccer", league: "uefa.champions", label: "Champions League"),
+        ScoreboardSpec(sport: "soccer", league: "uefa.europa", label: "Europa League"),
+        ScoreboardSpec(sport: "soccer", league: "usa.1", label: "MLS"),
+        ScoreboardSpec(sport: "soccer", league: "eng.1", label: "Premier League"),
+        ScoreboardSpec(sport: "soccer", league: "esp.1", label: "La Liga"),
+        ScoreboardSpec(sport: "soccer", league: "ger.1", label: "Bundesliga"),
+        ScoreboardSpec(sport: "soccer", league: "ita.1", label: "Serie A"),
+        ScoreboardSpec(sport: "soccer", league: "fra.1", label: "Ligue 1"),
+        ScoreboardSpec(sport: "soccer", league: "mex.1", label: "Liga MX"),
+        ScoreboardSpec(sport: "soccer", league: "bra.1", label: "Brasileirão"),
+        ScoreboardSpec(sport: "soccer", league: "arg.1", label: "Liga Profesional"),
+        ScoreboardSpec(sport: "soccer", league: "usa.nwsl", label: "NWSL"),
+        ScoreboardSpec(sport: "soccer", league: "eng.fa", label: "FA Cup"),
+        ScoreboardSpec(sport: "soccer", league: "uefa.nations", label: "UEFA Nations League"),
     ]
 
-    /// All live games across featured leagues (no query needed).
+    private static let usSportsScoreboards: [ScoreboardSpec] = [
+        ScoreboardSpec(sport: "football", league: "nfl", label: "NFL"),
+        ScoreboardSpec(sport: "basketball", league: "nba", label: "NBA"),
+        ScoreboardSpec(sport: "baseball", league: "mlb", label: "MLB"),
+        ScoreboardSpec(sport: "hockey", league: "nhl", label: "NHL"),
+        ScoreboardSpec(sport: "football", league: "college-football", label: "College Football"),
+        ScoreboardSpec(sport: "basketball", league: "mens-college-basketball", label: "Men's CBB"),
+        ScoreboardSpec(sport: "basketball", league: "womens-college-basketball", label: "Women's CBB"),
+        ScoreboardSpec(sport: "baseball", league: "college-baseball", label: "College Baseball"),
+    ]
+
+    private static var allScoreboards: [ScoreboardSpec] {
+        soccerScoreboards + usSportsScoreboards
+    }
+
+    private static func scoreboards(forSport sport: String?) -> [ScoreboardSpec] {
+        guard let sport else { return allScoreboards }
+        if sport == "soccer" { return soccerScoreboards }
+        return allScoreboards.filter { $0.sport == sport }
+    }
+
+    // MARK: - Public
+
     static func liveGamesToday() async -> [ESPNGameSearchResult] {
         var results: [ESPNGameSearchResult] = []
         var seen = Set<String>()
 
-        for board in featuredScoreboards {
-            do {
-                let games = try await fetchScoreboard(
-                    sport: board.sport,
-                    league: board.league,
-                    boardLabel: board.label,
-                    dates: scoreboardDateRange(pastDays: 1, futureDays: 1),
-                    matchingTokens: []
-                )
-                for game in games where game.isLive && seen.insert(game.eventID).inserted {
-                    results.append(game)
-                }
-            } catch {
-                continue
+        for board in allScoreboards {
+            guard let games = try? await fetchScoreboard(
+                spec: board,
+                dates: scoreboardDateRange(pastDays: 1, futureDays: 1),
+                matchingTokens: [],
+                teamID: nil
+            ) else { continue }
+
+            for game in games where game.isLive && seen.insert(game.eventID).inserted {
+                results.append(game)
             }
         }
 
@@ -80,49 +119,77 @@ enum ESPNGameSearchService {
         var results: [ESPNGameSearchResult] = []
         var seenIDs = Set<String>()
         var lastError: Error?
+        var searchedSports = Set<String>()
+
+        func append(_ games: [ESPNGameSearchResult]) {
+            for game in games where seenIDs.insert(game.eventID).inserted {
+                results.append(game)
+            }
+        }
 
         do {
             let searchItems = try await fetchSearchItems(query: trimmed)
-            for item in searchItems.prefix(8) {
-                if item.type == "team", let teamID = item.id, let sport = item.sport {
-                    let league = item.league ?? item.defaultLeagueSlug ?? ""
-                    let teamGames = await fetchTeamEventResults(
+
+            for item in searchItems.prefix(12) {
+                guard let sport = item.sport else { continue }
+                searchedSports.insert(sport)
+
+                if item.type == "team", let teamID = item.id {
+                    let teamGames = await gamesForTeam(
                         sport: sport,
-                        league: league,
+                        league: item.league ?? item.defaultLeagueSlug,
                         teamID: teamID,
+                        teamLabel: teamDisplayName(item),
                         query: trimmed
                     )
-                    for game in teamGames where seenIDs.insert(game.eventID).inserted {
-                        results.append(game)
+                    append(teamGames)
+                }
+
+                if item.type == "league" {
+                    let league = item.league ?? item.defaultLeagueSlug ?? ""
+                    guard !league.isEmpty else { continue }
+                    let spec = ScoreboardSpec(
+                        sport: sport,
+                        league: league,
+                        label: item.displayName ?? league
+                    )
+                    if let boardResults = try? await fetchScoreboard(
+                        spec: spec,
+                        dates: scoreboardDateRange(pastDays: 21, futureDays: 21),
+                        matchingTokens: [],
+                        teamID: nil
+                    ) {
+                        append(boardResults)
                     }
                 }
 
                 let boardResults = await gamesForSearchItem(item, query: trimmed)
-                for game in boardResults where seenIDs.insert(game.eventID).inserted {
-                    results.append(game)
-                }
+                append(boardResults)
             }
         } catch {
             lastError = error
         }
 
         let tokens = tokenize(trimmed)
-        let dateRange = scoreboardDateRange(pastDays: 14, futureDays: 14)
+        let boardsToScan = boardsToScanForFallback(
+            query: trimmed,
+            tokens: tokens,
+            searchedSports: searchedSports
+        )
 
-        for board in featuredScoreboards {
-            do {
-                let boardResults = try await fetchScoreboard(
-                    sport: board.sport,
-                    league: board.league,
-                    boardLabel: board.label,
-                    dates: dateRange,
-                    matchingTokens: tokens
-                )
-                for game in boardResults where seenIDs.insert(game.eventID).inserted {
-                    results.append(game)
+        await withTaskGroup(of: [ESPNGameSearchResult].self) { group in
+            for board in boardsToScan {
+                group.addTask {
+                    (try? await fetchScoreboard(
+                        spec: board,
+                        dates: scoreboardDateRange(pastDays: 21, futureDays: 21),
+                        matchingTokens: tokens,
+                        teamID: nil
+                    )) ?? []
                 }
-            } catch {
-                lastError = error
+            }
+            for await batch in group {
+                append(batch)
             }
         }
 
@@ -148,13 +215,14 @@ enum ESPNGameSearchService {
         let defaultLeagueSlug: String?
         let location: String?
         let name: String?
+        let abbreviation: String?
     }
 
     private static func fetchSearchItems(query: String) async throws -> [SearchItem] {
         var components = URLComponents(string: "https://site.web.api.espn.com/apis/common/v3/search")!
         components.queryItems = [
             URLQueryItem(name: "query", value: query),
-            URLQueryItem(name: "limit", value: "15"),
+            URLQueryItem(name: "limit", value: "20"),
         ]
         guard let url = components.url else { return [] }
 
@@ -168,126 +236,115 @@ enum ESPNGameSearchService {
         return (try JSONDecoder().decode(SearchResponse.self, from: data).items) ?? []
     }
 
-    private static func gamesForSearchItem(_ item: SearchItem, query: String) async -> [ESPNGameSearchResult] {
-        guard let sport = item.sport, let league = item.league ?? item.defaultLeagueSlug else { return [] }
-
-        let teamLabel = [item.location, item.name, item.displayName]
+    private static func teamDisplayName(_ item: SearchItem) -> String {
+        [item.location, item.name, item.displayName, item.abbreviation]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
+    }
 
-        let matchQuery = item.type == "team" && !teamLabel.isEmpty ? teamLabel : query
-        let tokens = tokenize(matchQuery)
+    private static func gamesForSearchItem(_ item: SearchItem, query: String) async -> [ESPNGameSearchResult] {
+        guard let sport = item.sport, let league = item.league ?? item.defaultLeagueSlug else { return [] }
+
+        let matchQuery = item.type == "team" ? teamDisplayName(item) : query
+        let tokens = tokenize(matchQuery.isEmpty ? query : matchQuery)
+        let spec = ScoreboardSpec(sport: sport, league: league, label: item.displayName ?? league)
 
         return (try? await fetchScoreboard(
-            sport: sport,
-            league: league,
-            boardLabel: league,
-            dates: scoreboardDateRange(pastDays: 14, futureDays: 14),
-            matchingTokens: tokens
+            spec: spec,
+            dates: scoreboardDateRange(pastDays: 21, futureDays: 21),
+            matchingTokens: tokens,
+            teamID: nil
         )) ?? []
     }
 
-    // MARK: - Team events (core API)
+    // MARK: - Team games
 
-    private struct CoreListResponse: Decodable {
-        let items: [CoreRef]?
-    }
+    private static func gamesForTeam(
+        sport: String,
+        league: String?,
+        teamID: String,
+        teamLabel: String,
+        query: String
+    ) async -> [ESPNGameSearchResult] {
+        var results: [ESPNGameSearchResult] = []
+        var seen = Set<String>()
+        let dateRange = scoreboardDateRange(pastDays: 21, futureDays: 21)
+        let boards = prioritizeBoards(scoreboards(forSport: sport), primaryLeague: league)
 
-    private struct CoreRef: Decodable {
-        let ref: String
-
-        enum CodingKeys: String, CodingKey {
-            case ref = "$ref"
-        }
-    }
-
-    private struct CoreEventDetail: Decodable {
-        let id: FlexibleID
-        let name: String?
-        let shortName: String?
-        let competitions: [CoreCompetition]?
-    }
-
-    private struct CoreCompetition: Decodable {
-        let status: ScoreboardStatus?
-    }
-
-    private struct FlexibleID: Decodable {
-        let value: String
-
-        init(from decoder: Decoder) throws {
-            let container = try decoder.singleValueContainer()
-            if let string = try? container.decode(String.self) {
-                value = string
-            } else if let int = try? container.decode(Int.self) {
-                value = String(int)
-            } else {
-                value = ""
+        func ingest(_ games: [ESPNGameSearchResult]) {
+            for game in games where seen.insert(game.eventID).inserted {
+                results.append(game)
             }
         }
+
+        await withTaskGroup(of: [ESPNGameSearchResult].self) { group in
+            for board in boards {
+                group.addTask {
+                    (try? await fetchScoreboard(
+                        spec: board,
+                        dates: dateRange,
+                        matchingTokens: [],
+                        teamID: teamID
+                    )) ?? []
+                }
+            }
+            for await batch in group {
+                ingest(batch)
+            }
+        }
+
+        if results.isEmpty {
+            for board in boards.prefix(8) {
+                let scheduled = await fetchSiteTeamSchedule(
+                    sport: sport,
+                    league: board.league,
+                    teamID: teamID,
+                    boardLabel: board.label
+                )
+                ingest(scheduled)
+                if !results.isEmpty { break }
+            }
+        }
+
+        return results
     }
 
-    private static func fetchTeamEventResults(
+    private static func prioritizeBoards(_ boards: [ScoreboardSpec], primaryLeague: String?) -> [ScoreboardSpec] {
+        guard let primaryLeague, !primaryLeague.isEmpty else { return boards }
+        var ordered = boards
+        if let index = ordered.firstIndex(where: { $0.league == primaryLeague }) {
+            let primary = ordered.remove(at: index)
+            ordered.insert(primary, at: 0)
+        } else {
+            ordered.insert(
+                ScoreboardSpec(sport: boards.first?.sport ?? "soccer", league: primaryLeague, label: primaryLeague),
+                at: 0
+            )
+        }
+        return ordered
+    }
+
+    private static func fetchSiteTeamSchedule(
         sport: String,
         league: String,
         teamID: String,
-        query: String
+        boardLabel: String
     ) async -> [ESPNGameSearchResult] {
-        guard let url = URL(string: "https://sports.core.api.espn.com/v2/sports/\(sport)/teams/\(teamID)/events?limit=30") else {
+        guard let url = URL(string: "https://site.api.espn.com/apis/site/v2/sports/\(sport)/\(league)/teams/\(teamID)/schedule") else {
             return []
         }
 
         guard let (data, response) = try? await URLSession.shared.data(from: url),
               let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
-              let list = try? JSONDecoder().decode(CoreListResponse.self, from: data),
-              let items = list.items else {
+              let schedule = try? JSONDecoder().decode(ScoreboardResponse.self, from: data) else {
             return []
         }
 
-        let tokens = tokenize(query)
-        var results: [ESPNGameSearchResult] = []
-
-        for item in items.prefix(20) {
-            let refURLString = item.ref.replacingOccurrences(of: "http://", with: "https://")
-            guard let refURL = URL(string: refURLString),
-                  let (eventData, eventResponse) = try? await URLSession.shared.data(from: refURL),
-                  let eventHTTP = eventResponse as? HTTPURLResponse,
-                  (200...299).contains(eventHTTP.statusCode),
-                  let event = try? JSONDecoder().decode(CoreEventDetail.self, from: eventData) else {
-                continue
-            }
-
-            let haystack = [event.name, event.shortName]
-                .compactMap { $0?.lowercased() }
-                .joined(separator: " ")
-            guard matchesQuery(haystack: haystack, tokens: tokens) else { continue }
-
-            let status = event.competitions?.first?.status?.type
-            let state = status?.state?.lowercased() ?? ""
-            let isLive = state == "in"
-            let statusLabel = status?.shortDetail
-                ?? status?.description
-                ?? status?.detail
-                ?? (isLive ? "Live" : "Scheduled")
-
-            let eventID = event.id.value
-            guard !eventID.isEmpty, !league.isEmpty else { continue }
-
-            results.append(
-                ESPNGameSearchResult(
-                    id: "\(sport)/\(league)/\(eventID)",
-                    eventID: eventID,
-                    sportPath: "\(sport)/\(league)",
-                    title: event.shortName ?? event.name ?? "Game \(eventID)",
-                    statusLabel: statusLabel,
-                    isLive: isLive
-                )
-            )
+        return (schedule.events ?? []).compactMap { event in
+            mapEvent(event, sport: sport, league: league, boardLabel: boardLabel)
         }
-
-        return results
     }
 
     // MARK: - Scoreboard
@@ -305,6 +362,17 @@ enum ESPNGameSearchService {
 
     private struct ScoreboardCompetition: Decodable {
         let status: ScoreboardStatus?
+        let competitors: [ScoreboardCompetitor]?
+    }
+
+    private struct ScoreboardCompetitor: Decodable {
+        let team: ScoreboardTeam?
+    }
+
+    private struct ScoreboardTeam: Decodable {
+        let id: FlexibleID
+        let displayName: String?
+        let abbreviation: String?
     }
 
     private struct ScoreboardStatus: Decodable {
@@ -319,15 +387,29 @@ enum ESPNGameSearchService {
         let shortDetail: String?
     }
 
+    private struct FlexibleID: Decodable {
+        let value: String
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            if let string = try? container.decode(String.self) {
+                value = string
+            } else if let int = try? container.decode(Int.self) {
+                value = String(int)
+            } else {
+                value = ""
+            }
+        }
+    }
+
     private static func fetchScoreboard(
-        sport: String,
-        league: String,
-        boardLabel: String,
+        spec: ScoreboardSpec,
         dates: String,
-        matchingTokens: [String]
+        matchingTokens: [String],
+        teamID: String?
     ) async throws -> [ESPNGameSearchResult] {
         var components = URLComponents(
-            string: "https://site.api.espn.com/apis/site/v2/sports/\(sport)/\(league)/scoreboard"
+            string: "https://site.api.espn.com/apis/site/v2/sports/\(spec.sport)/\(spec.league)/scoreboard"
         )!
         components.queryItems = [
             URLQueryItem(name: "dates", value: dates),
@@ -340,16 +422,20 @@ enum ESPNGameSearchService {
             throw ESPNGameSearchError.network("no HTTP response")
         }
         guard (200...299).contains(http.statusCode) else {
-            throw ESPNGameSearchError.network("HTTP \(http.statusCode) for \(league)")
+            throw ESPNGameSearchError.network("HTTP \(http.statusCode) for \(spec.league)")
         }
 
         let scoreboard = try JSONDecoder().decode(ScoreboardResponse.self, from: data)
 
         return (scoreboard.events ?? []).compactMap { event in
+            if let teamID, !eventIncludesTeam(event, teamID: teamID) {
+                return nil
+            }
+
             let haystack = [
                 event.name,
                 event.shortName,
-                boardLabel,
+                spec.label,
             ]
             .compactMap { $0?.lowercased() }
             .joined(separator: " ")
@@ -358,26 +444,69 @@ enum ESPNGameSearchService {
                 return nil
             }
 
-            let status = event.competitions?.first?.status?.type
-            let state = status?.state?.lowercased() ?? ""
-            let isLive = state == "in"
-            let statusLabel = status?.shortDetail
-                ?? status?.description
-                ?? status?.detail
-                ?? (isLive ? "Live" : "Scheduled")
-
-            let eventID = event.id.value
-            guard !eventID.isEmpty else { return nil }
-
-            return ESPNGameSearchResult(
-                id: "\(sport)/\(league)/\(eventID)",
-                eventID: eventID,
-                sportPath: "\(sport)/\(league)",
-                title: event.shortName ?? event.name ?? "Game \(eventID)",
-                statusLabel: statusLabel,
-                isLive: isLive
-            )
+            return mapEvent(event, sport: spec.sport, league: spec.league, boardLabel: spec.label)
         }
+    }
+
+    private static func eventIncludesTeam(_ event: ScoreboardEvent, teamID: String) -> Bool {
+        guard let competitors = event.competitions?.first?.competitors else { return false }
+        return competitors.contains { $0.team?.id.value == teamID }
+    }
+
+    private static func mapEvent(
+        _ event: ScoreboardEvent,
+        sport: String,
+        league: String,
+        boardLabel: String
+    ) -> ESPNGameSearchResult? {
+        let status = event.competitions?.first?.status?.type
+        let state = status?.state?.lowercased() ?? ""
+        let isLive = state == "in" || status?.name.uppercased() == "STATUS_IN_PROGRESS"
+        let statusLabel = status?.shortDetail
+            ?? status?.description
+            ?? status?.detail
+            ?? (isLive ? "Live" : "Scheduled")
+
+        let eventID = event.id.value
+        guard !eventID.isEmpty else { return nil }
+
+        return ESPNGameSearchResult(
+            id: "\(sport)/\(league)/\(eventID)",
+            eventID: eventID,
+            sportPath: "\(sport)/\(league)",
+            title: event.shortName ?? event.name ?? "Game \(eventID)",
+            statusLabel: statusLabel,
+            leagueLabel: boardLabel,
+            isLive: isLive
+        )
+    }
+
+    // MARK: - Fallback board selection
+
+    private static let soccerQueryHints: Set<String> = [
+        "soccer", "football", "futbol", "mls", "liga", "premier", "champions",
+        "argentina", "brazil", "mexico", "barcelona", "madrid", "liverpool",
+        "world", "copa", "uefa", "fifa", "messi", "ronaldo"
+    ]
+
+    private static func boardsToScanForFallback(
+        query: String,
+        tokens: [String],
+        searchedSports: Set<String>
+    ) -> [ScoreboardSpec] {
+        if searchedSports.contains("soccer") || looksLikeSoccerQuery(query, tokens: tokens) {
+            return soccerScoreboards + usSportsScoreboards
+        }
+        if searchedSports.contains("football") && !searchedSports.contains("soccer") {
+            return usSportsScoreboards.filter { $0.sport == "football" } + soccerScoreboards
+        }
+        return allScoreboards
+    }
+
+    private static func looksLikeSoccerQuery(_ query: String, tokens: [String]) -> Bool {
+        let lower = query.lowercased()
+        if soccerQueryHints.contains(where: { lower.contains($0) }) { return true }
+        return tokens.contains(where: { soccerQueryHints.contains($0) })
     }
 
     // MARK: - Dates
@@ -404,7 +533,7 @@ enum ESPNGameSearchService {
     }
 
     private static let stopWords: Set<String> = [
-        "game", "games", "today", "tonight", "live", "match", "vs", "the", "at", "my"
+        "game", "games", "today", "tonight", "live", "match", "vs", "the", "at", "my", "fc"
     ]
 
     private static func matchesQuery(haystack: String, tokens: [String]) -> Bool {
@@ -412,12 +541,16 @@ enum ESPNGameSearchService {
         if tokens.count == 1 {
             return haystack.contains(tokens[0])
         }
-        return tokens.allSatisfy { haystack.contains($0) }
+        return tokens.filter { $0.count >= 3 }.allSatisfy { haystack.contains($0) }
+            || tokens.allSatisfy { haystack.contains($0) }
     }
 
     private static func sortResults(_ results: [ESPNGameSearchResult]) -> [ESPNGameSearchResult] {
         results.sorted { lhs, rhs in
             if lhs.isLive != rhs.isLive { return lhs.isLive && !rhs.isLive }
+            if lhs.sportPath.hasPrefix("soccer") != rhs.sportPath.hasPrefix("soccer") {
+                return lhs.sportPath.hasPrefix("soccer") && !rhs.sportPath.hasPrefix("soccer")
+            }
             return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
         }
     }

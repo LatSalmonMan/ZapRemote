@@ -53,9 +53,11 @@ struct SettingsView: View {
 
     @State private var isCheckoutSheetPresented = false
     @State private var isGameSearchPresented = false
-    @State private var isClockSyncPresented = false
-    @State private var isAdvancedExpanded = false
-    @State private var isDeveloperToolsExpanded = false
+    @State private var isCloudExpanded = false
+
+    #if DEBUG
+    @State private var isDebugExpanded = false
+    #endif
 
     @Environment(\.openURL) private var openURL
 
@@ -69,17 +71,25 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                SettingsBackground()
+                CouchModeScreenBackground(theme: theme, streamingAccent: selectedStreamingService.accent)
 
-                List {
-                    tonightSection
-                    tvConnectionAndDelaySection
-                    cloudSection
-                    premiumSection
-                    moreSection
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(spacing: 18) {
+                        gameNightSection
+                        timelineSyncSection
+                        tvSection
+                        automationSection
+                        cloudSection
+                        premiumSection
+                        supportSection
+                        #if DEBUG
+                        debugSection
+                        #endif
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.top, 8)
+                    .padding(.bottom, 36)
                 }
-                .listStyle(.insetGrouped)
-                .scrollContentBackground(.hidden)
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.large)
@@ -90,9 +100,6 @@ struct SettingsView: View {
                 GameSearchSheet(sportsAPIService: sportsAPIService)
                     .preferredColorScheme(.dark)
             }
-            .sheet(isPresented: $isClockSyncPresented) {
-                StreamClockSyncSheet(sportsAPIService: sportsAPIService)
-            }
             .syncStreamingServicePreference(
                 tvController: tvController,
                 storageRawValue: defaultStreamingServiceRaw
@@ -102,242 +109,337 @@ struct SettingsView: View {
 
     // MARK: - Sections
 
-    private var tonightSection: some View {
-        Section {
-            Picker(selection: Binding(
-                get: { selectedStreamingService },
-                set: { selectedStreamingService = $0 }
-            )) {
-                ForEach(StreamingServicePreference.allCases) { service in
-                    Label { Text(service.rawValue) } icon: {
-                        Image(systemName: service.iconName).foregroundStyle(service.accent)
-                    }
-                    .tag(service)
-                }
-            } label: {
-                Label("Streaming app on TV", systemImage: "play.tv")
-            }
-            .listRowBackground(SettingsRowBackground())
+    private var gameNightSection: some View {
+        SettingsCard(theme: theme, title: "Game Night", icon: "sportscourt") {
+            VStack(spacing: 14) {
+                streamingPicker
 
-            Button {
-                isGameSearchPresented = true
-            } label: {
-                HStack {
-                    Label {
+                Button {
+                    isGameSearchPresented = true
+                } label: {
+                    HStack(spacing: 12) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(selectedStreamingService.accent.opacity(0.18))
+                                .frame(width: 40, height: 40)
+                            Image(systemName: "sportscourt.fill")
+                                .foregroundStyle(selectedStreamingService.accent)
+                        }
+
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(sportsAPIService.monitoredGameLabel.isEmpty ? "Choose game" : sportsAPIService.monitoredGameLabel)
-                                .foregroundStyle(.white.opacity(0.90))
+                            Text(sportsAPIService.monitoredGameLabel.isEmpty ? "Find tonight's game" : sportsAPIService.monitoredGameLabel)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.white.opacity(0.92))
+                                .multilineTextAlignment(.leading)
                             Text(sportsAPIService.monitoringStatus.displayLabel)
                                 .font(.caption)
-                                .foregroundStyle(.white.opacity(0.40))
+                                .foregroundStyle(.white.opacity(0.42))
                         }
-                    } icon: {
-                        Image(systemName: "sportscourt")
+
+                        Spacer(minLength: 0)
+
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.white.opacity(0.28))
                     }
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.30))
+                    .contentShape(Rectangle())
                 }
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
-            .listRowBackground(SettingsRowBackground())
-
-            Button {
-                isClockSyncPresented = true
-            } label: {
-                HStack {
-                    Label {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Match clock (full screen)")
-                                .foregroundStyle(.white.opacity(0.90))
-                            Text("Larger ± clock UI for fine-tuning beyond 60s")
-                                .font(.caption)
-                                .foregroundStyle(.white.opacity(0.40))
-                        }
-                    } icon: {
-                        Image(systemName: "clock.arrow.2.circlepath")
-                    }
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.30))
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .listRowBackground(SettingsRowBackground())
-
-            Toggle(isOn: $sportsAPIService.isHandsFreeAutomationEnabled) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Hands-free ad skip")
-                    Text("ESPN stoppage or cloud ad_start → up to 3 highlights → Go Live")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.40))
-                }
-            }
-            .listRowBackground(SettingsRowBackground())
-
-            Toggle(isOn: $sportsAPIService.autoReturnToLiveAfterHighlight) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Auto Go Live after highlight")
-                    Text("Waits ~45–60s on the highlight, then jumps back to live")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.40))
-                }
-            }
-            .listRowBackground(SettingsRowBackground())
-
-            Text(selectedStreamingService.macroBehaviorNote)
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.40))
-                .listRowBackground(SettingsRowBackground())
-        } header: {
-            SettingsSectionHeader(title: "Tonight", icon: "sportscourt")
-        } footer: {
-            Text("Open YouTube TV, Hulu, or Peacock on your TV before using skip macros.")
         }
     }
 
-    private var tvConnectionAndDelaySection: some View {
-        Section {
-            HStack(spacing: 12) {
-                Circle()
-                    .fill(tvController.isConnected ? theme.accentPrimary : Color.white.opacity(0.25))
-                    .frame(width: 10, height: 10)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(tvController.isConnected ? "TV connected" : "TV not connected")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.88))
-                    Text(tvController.connectionStatusHeadline)
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.42))
-                }
-                Spacer()
-            }
-            .listRowBackground(SettingsRowBackground())
+    private var streamingPicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Streaming on TV")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.45))
 
-            StreamDelayHueSyncPanel(apiService: sportsAPIService, theme: theme)
-                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 12, trailing: 16))
-                .listRowBackground(SettingsRowBackground())
-        } header: {
-            SettingsSectionHeader(title: "TV Connection & Delay", icon: "tv.and.hifispeaker.fill")
-        } footer: {
-            Text("Drag the slider until the app clock matches your TV. The offset feeds highlight skip timing instantly.")
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(StreamingServicePreference.allCases) { service in
+                        Button {
+                            selectedStreamingService = service
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: service.iconName)
+                                    .font(.caption.weight(.semibold))
+                                Text(service.rawValue)
+                                    .font(.caption.weight(.semibold))
+                            }
+                            .foregroundStyle(
+                                selectedStreamingService == service
+                                    ? .white
+                                    : .white.opacity(0.55)
+                            )
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 9)
+                            .background(
+                                Capsule()
+                                    .fill(
+                                        selectedStreamingService == service
+                                            ? service.accent.opacity(0.55)
+                                            : Color.white.opacity(0.07)
+                                    )
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            Text(selectedStreamingService.macroBehaviorNote)
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.32))
+        }
+    }
+
+    private var timelineSyncSection: some View {
+        SettingsCard(
+            theme: theme,
+            title: sportsAPIService.isReplayOffsetMode ? "TV Delay" : "Match Clock",
+            icon: sportsAPIService.isReplayOffsetMode ? "timer" : "clock.badge.checkmark"
+        ) {
+            TimelineSyncView(
+                apiService: sportsAPIService,
+                theme: theme,
+                showsResyncButton: true
+            )
+        }
+    }
+
+    private var tvSection: some View {
+        SettingsCard(theme: theme, title: "TV", icon: "tv.fill") {
+            VStack(spacing: 14) {
+                HStack(spacing: 12) {
+                    Circle()
+                        .fill(tvController.isConnected ? theme.accentPrimary : Color.white.opacity(0.22))
+                        .frame(width: 10, height: 10)
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(tvController.isConnected ? "Connected" : "Not connected")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white.opacity(0.90))
+                        Text(tvController.connectionStatusHeadline)
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.42))
+                    }
+
+                    Spacer()
+
+                    if tvController.isConnected {
+                        Button("Test alert") {
+                            Task { await tvController.sendTestTVNotification() }
+                        }
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(theme.accentPrimary)
+                    }
+                }
+
+                Button(role: .destructive) {
+                    Task { await tvController.resetTVConnection() }
+                } label: {
+                    Label("Reset TV connection", systemImage: "arrow.counterclockwise")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var automationSection: some View {
+        SettingsCard(theme: theme, title: "Automation", icon: "bolt.fill") {
+            VStack(spacing: 16) {
+                SettingsToggleRow(
+                    title: "Hands-free ad skip",
+                    subtitle: "ESPN stoppage or cloud detector → highlights → Go Live",
+                    isOn: $sportsAPIService.isHandsFreeAutomationEnabled
+                )
+
+                Divider().overlay(Color.white.opacity(0.08))
+
+                SettingsToggleRow(
+                    title: "Auto Go Live",
+                    subtitle: "Return to live ~45s after each highlight",
+                    isOn: $sportsAPIService.autoReturnToLiveAfterHighlight
+                )
+            }
         }
     }
 
     private var cloudSection: some View {
-        Section {
-            TextField("ws://192.168.x.x:8787", text: $adEventService.cloudWebSocketURLString)
-                .font(.caption.monospaced())
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .listRowBackground(SettingsRowBackground())
+        SettingsCard(theme: theme, title: "Cloud Detector", icon: "waveform", isCollapsible: true, isExpanded: $isCloudExpanded) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Optional Mac bridge for broadcast ad cues")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.40))
 
-            HStack {
-                Text(adEventService.bridgeStatus.displayLabel)
-                    .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.65))
-                Spacer()
-                if adEventService.hasConfiguredDetectorURL {
-                    Button(adEventService.bridgeStatus == .connected ? "Reconnect" : "Connect") {
-                        adEventService.stopListening()
-                        adEventService.startListening()
+                TextField("ws://192.168.x.x:8787", text: $adEventService.cloudWebSocketURLString)
+                    .font(.caption.monospaced())
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .padding(12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.white.opacity(0.06))
+                    )
+
+                HStack {
+                    Text(adEventService.bridgeStatus.displayLabel)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.55))
+                    Spacer()
+                    if adEventService.hasConfiguredDetectorURL {
+                        Button(adEventService.bridgeStatus == .connected ? "Reconnect" : "Connect") {
+                            adEventService.stopListening()
+                            adEventService.startListening()
+                        }
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(theme.accentPrimary)
                     }
-                    .font(.subheadline.weight(.semibold))
                 }
             }
-            .listRowBackground(SettingsRowBackground())
-        } header: {
-            SettingsSectionHeader(title: "Cloud detector", icon: "waveform")
-        } footer: {
-            Text("Optional. Run detector on your Mac — point phone at ws://YOUR-MAC-IP:8787")
         }
     }
 
     private var premiumSection: some View {
-        Section {
-            PremiumSubscriptionCard(
-                theme: theme,
-                onActivate: { isCheckoutSheetPresented = true },
-                onManage: openStripeBillingPortal
-            )
-            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
-            .listRowBackground(Color.clear)
-            .listRowSeparator(.hidden)
-        }
+        PremiumSubscriptionCard(
+            theme: theme,
+            onActivate: { isCheckoutSheetPresented = true },
+            onManage: openStripeBillingPortal
+        )
     }
 
-    private var moreSection: some View {
-        Section {
+    private var supportSection: some View {
+        SettingsCard(theme: theme, title: "Help", icon: "questionmark.circle") {
             NavigationLink {
                 AutomaticRewindExplainerView()
             } label: {
                 Label("How automatic rewind works", systemImage: "info.circle")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.85))
             }
-            .listRowBackground(SettingsRowBackground())
+        }
+    }
 
-            Button(role: .destructive) {
-                Task { await tvController.resetTVConnection() }
-            } label: {
-                Label("Reset TV connection", systemImage: "arrow.counterclockwise")
-            }
-            .listRowBackground(SettingsRowBackground())
-
-            if tvController.isConnected {
-                Button {
-                    Task { await tvController.sendTestTVNotification() }
-                } label: {
-                    Label("Send test alert to TV", systemImage: "bell.badge")
-                }
-                .listRowBackground(SettingsRowBackground())
-            }
-
-            DisclosureGroup("Advanced", isExpanded: $isAdvancedExpanded) {
+    #if DEBUG
+    private var debugSection: some View {
+        SettingsCard(theme: theme, title: "Developer", icon: "hammer.fill", isCollapsible: true, isExpanded: $isDebugExpanded) {
+            VStack(alignment: .leading, spacing: 10) {
                 TextField("ESPN game ID", text: $sportsAPIService.monitoredGameID)
-                    .font(.body.monospaced())
+                    .font(.caption.monospaced())
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                    .listRowBackground(SettingsRowBackground())
 
                 Button("Restart ESPN polling") {
                     sportsAPIService.stopGamePolling()
                     sportsAPIService.startGamePolling()
                 }
-                .listRowBackground(SettingsRowBackground())
+                .font(.caption.weight(.semibold))
 
-                Text(sportsAPIService.lastStatusSummary)
-                    .font(.caption)
-                    .foregroundStyle(.white.opacity(0.45))
-                    .listRowBackground(SettingsRowBackground())
-            }
-            .listRowBackground(SettingsRowBackground())
-
-            DisclosureGroup("Developer", isExpanded: $isDeveloperToolsExpanded) {
                 Button("Simulate cloud ad") { adEventService.simulateAdStart() }
-                    .listRowBackground(SettingsRowBackground())
                 Button("Simulate game live") { adEventService.simulateGameLive() }
-                    .listRowBackground(SettingsRowBackground())
-                Button("Simulate manual ad skip") {
+                Button("Simulate ad skip") {
                     Task { await sportsAPIService.skipAdToHighlights() }
                 }
-                .listRowBackground(SettingsRowBackground())
-                Button("Simulate play resumed") { sportsAPIService.simulatePlayResumed() }
-                    .listRowBackground(SettingsRowBackground())
+                .font(.caption.weight(.semibold))
             }
-            .listRowBackground(SettingsRowBackground())
-        } header: {
-            SettingsSectionHeader(title: "More", icon: "ellipsis.circle")
-        } footer: {
-            Text(tvController.statusMessage)
+            .foregroundStyle(.white.opacity(0.65))
         }
     }
+    #endif
 
     private func openStripeBillingPortal() {
         guard let url = URL(string: "https://billing.stripe.com/p/login/test") else { return }
         openURL(url)
+    }
+}
+
+// MARK: - Settings Card Chrome
+
+private struct SettingsCard<Content: View>: View {
+    let theme: AppTheme
+    let title: String
+    let icon: String
+    var isCollapsible: Bool = false
+    @Binding var isExpanded: Bool
+    @ViewBuilder let content: () -> Content
+
+    init(
+        theme: AppTheme,
+        title: String,
+        icon: String,
+        isCollapsible: Bool = false,
+        isExpanded: Binding<Bool> = .constant(true),
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.theme = theme
+        self.title = title
+        self.icon = icon
+        self.isCollapsible = isCollapsible
+        self._isExpanded = isExpanded
+        self.content = content
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if isCollapsible {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.22)) { isExpanded.toggle() }
+                } label: {
+                    HStack {
+                        headerLabel
+                        Spacer()
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.white.opacity(0.35))
+                    }
+                }
+                .buttonStyle(.plain)
+            } else {
+                headerLabel
+            }
+
+            if !isCollapsible || isExpanded {
+                content()
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .premiumCardStyle(theme: theme, cornerRadius: 18, isActive: false)
+    }
+
+    private var headerLabel: some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(theme.accentPrimary)
+            Text(title.uppercased())
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.white.opacity(0.45))
+                .tracking(0.6)
+        }
+    }
+}
+
+private struct SettingsToggleRow: View {
+    let title: String
+    let subtitle: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Toggle(isOn: $isOn) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.88))
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.40))
+            }
+        }
+        .tint(AppTheme.premium.accentPrimary)
     }
 }
 
@@ -352,18 +454,18 @@ private struct PremiumSubscriptionCard: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Premium")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.45))
-                        .textCase(.uppercase)
+                    Text("PREMIUM")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.white.opacity(0.40))
+                        .tracking(0.6)
 
                     Text("$10 / month")
-                        .font(.title3.weight(.bold))
+                        .font(.title2.weight(.bold))
                         .foregroundStyle(theme.headerGradient)
 
                     Text("Hands-free commercial rewinds")
                         .font(.footnote)
-                        .foregroundStyle(.white.opacity(0.50))
+                        .foregroundStyle(.white.opacity(0.48))
                 }
 
                 Spacer()
@@ -390,145 +492,17 @@ private struct PremiumSubscriptionCard: View {
                             )
                     )
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.plain)
 
             Button(action: onManage) {
                 Label("Manage subscription", systemImage: "arrow.up.forward.app")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.55))
-                    .frame(maxWidth: .infinity)
+                    .foregroundStyle(.white.opacity(0.50))
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.plain)
         }
         .padding(16)
         .premiumCardStyle(theme: theme, cornerRadius: 18, isActive: true)
-        .padding(.horizontal, 16)
-    }
-}
-
-private struct SettingsBackground: View {
-    var body: some View {
-        Color(red: 0.08, green: 0.08, blue: 0.09).ignoresSafeArea()
-    }
-}
-
-private struct SettingsSectionHeader: View {
-    let title: String
-    let icon: String
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: icon).font(.caption2.weight(.semibold))
-            Text(title)
-        }
-        .foregroundStyle(.white.opacity(0.45))
-        .textCase(.uppercase)
-    }
-}
-
-private struct SettingsRowBackground: View {
-    var body: some View {
-        RoundedRectangle(cornerRadius: 10, style: .continuous)
-            .fill(Color.white.opacity(0.05))
-    }
-}
-
-// MARK: - Hue-Style Stream Delay Sync
-
-private struct StreamDelayHueSyncPanel: View {
-    @ObservedObject var apiService: SportsAPIService
-    let theme: AppTheme
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            timeSyncReadoutPanel
-
-            VStack(alignment: .leading, spacing: 10) {
-                Slider(
-                    value: $apiService.streamDelaySeconds,
-                    in: SportsAPIService.settingsSliderDelayRange,
-                    step: SportsAPIService.settingsSliderStep
-                )
-                .tint(theme.accentPrimary)
-
-                HStack {
-                    Text("0s")
-                    Spacer()
-                    Text("60s")
-                }
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.white.opacity(0.32))
-            }
-
-            streamOffsetReadoutCard
-        }
-        .padding(.vertical, 4)
-        .animation(.easeInOut(duration: 0.22), value: apiService.streamDelaySeconds)
-    }
-
-    private var timeSyncReadoutPanel: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(
-                "Instructions: Compare the clock below with your television screen. "
-                + "Move the slider until the app timeline matches your TV feed exactly."
-            )
-            .font(.caption)
-            .foregroundStyle(.white.opacity(0.48))
-            .fixedSize(horizontal: false, vertical: true)
-
-            TimelineView(.periodic(from: .now, by: 1)) { timeline in
-                let clock = apiService.syncedTimelineClockDisplay(at: timeline.date)
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("APP TIMELINE")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.white.opacity(0.35))
-
-                    Text(clock)
-                        .font(.system(size: 38, weight: .bold, design: .rounded))
-                        .foregroundStyle(theme.accentPrimary)
-                        .monospacedDigit()
-                        .minimumScaleFactor(0.55)
-                        .lineLimit(1)
-                        .contentTransition(.numericText())
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .animation(.easeInOut(duration: 0.22), value: apiService.streamDelaySeconds)
-            }
-        }
-        .padding(16)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color.white.opacity(0.06))
-        )
-    }
-
-    private var streamOffsetReadoutCard: some View {
-        Text(apiService.streamOffsetReadout)
-            .font(.subheadline.weight(.semibold))
-            .foregroundStyle(theme.headerGradient)
-            .multilineTextAlignment(.leading)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 14)
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                theme.accentPrimary.opacity(0.22),
-                                theme.accentSecondary.opacity(0.10)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .strokeBorder(theme.accentPrimary.opacity(0.35), lineWidth: 1)
-                    )
-            )
-            .contentTransition(.numericText())
     }
 }
 

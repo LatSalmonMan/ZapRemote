@@ -478,6 +478,31 @@ final class TVController: ObservableObject {
         return clicks * secondsPerClick
     }
 
+    /// Universal highlight rewind — timestamp offset + stream lag, sport-agnostic.
+    @discardableResult
+    func triggerRewindMacro(
+        highlightDate: Date,
+        streamDelaySeconds: Double,
+        maxSeconds: Int? = nil,
+        now: Date = Date()
+    ) -> Bool {
+        let calculated = TimelineOffsetEngine.rewindSeconds(
+            highlightDate: highlightDate,
+            streamDelaySeconds: streamDelaySeconds,
+            now: now
+        )
+        let capped = maxSeconds.map { min(calculated, $0) } ?? calculated
+        let snapped = snappedSkipSeconds(targetSeconds: capped)
+        print(
+            "⏪ TVController: universal rewind "
+            + "elapsed=\(Int(now.timeIntervalSince(highlightDate)))s "
+            + "+ lead=\(Int(TimelineOffsetEngine.rewindLeadSeconds))s "
+            + "+ lag=\(Int(streamDelaySeconds.rounded()))s "
+            + "→ \(snapped)s (\(snapped / secondsPerSkipClick()) clicks)"
+        )
+        return triggerRewindMacro(targetSeconds: snapped)
+    }
+
     private func resolvedClickSpacingMs() -> Int {
         if let appID = currentAppID.isEmpty ? nil : currentAppID,
            StreamingAppSkipProfile.profile(for: appID) != .unsupported {

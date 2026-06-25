@@ -2,7 +2,7 @@
 
 iOS TV remote for LG webOS TVs — commercial-break automation with ESPN highlight targeting and optional broadcast ad detection.
 
-> **Status: WIP (~70% working)** — LG TV macros, ESPN polling, clock sync, and highlight rewind are implemented but not fully reliable end-to-end (skip depth, Go Live edge, and hands-free timing still need tuning). Saved as a checkpoint.
+> **Status: WIP** — Core loop shipped (`working-v1`). See **[ROADMAP.md](ROADMAP.md)** for product + valuation milestones and what to build next.
 
 ## iOS app
 

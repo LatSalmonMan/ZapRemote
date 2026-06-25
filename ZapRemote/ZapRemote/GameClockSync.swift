@@ -73,6 +73,33 @@ struct ESPNGameClock: Equatable, Sendable {
     }
 }
 
+// MARK: - Universal Timeline Offset
+
+/// Sport-agnostic sync math — wall-clock timestamps only, never display-string arithmetic.
+enum TimelineOffsetEngine {
+
+    /// Lead buffer before the highlight moment on the DVR timeline.
+    static let rewindLeadSeconds: Double = 15.0
+
+    /// Rewind depth from a highlight's ESPN ISO-8601 wallclock.
+    /// `secondsElapsed + lead + streamDelay` — works for soccer (count-up) and NFL (count-down).
+    static func rewindSeconds(
+        highlightDate: Date,
+        streamDelaySeconds: Double,
+        now: Date = Date(),
+        leadSeconds: Double = rewindLeadSeconds
+    ) -> Int {
+        let secondsElapsed = now.timeIntervalSince(highlightDate)
+        let finalCalculatedRewind = secondsElapsed + leadSeconds + streamDelaySeconds
+        return max(1, Int(finalCalculatedRewind.rounded()))
+    }
+
+    /// Wall-clock instant that maps to what the user's delayed TV feed is showing now.
+    static func tvTimelineMoment(now: Date = Date(), streamDelaySeconds: Double) -> Date {
+        now.addingTimeInterval(-streamDelaySeconds)
+    }
+}
+
 // MARK: - Sync Engine
 
 enum GameClockSyncEngine {
@@ -184,13 +211,28 @@ enum GameClockSyncEngine {
         return minutes * 60 + seconds
     }
 
+    /// Pulls `8:45` or `67'` from scoreboard `status.type.detail` strings.
+    static func extractClockToken(from detail: String) -> String? {
+        let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        if let range = trimmed.range(of: #"\d+:\d{2}"#, options: .regularExpression) {
+            return String(trimmed[range])
+        }
+        if let range = trimmed.range(of: #"\d+'(?:\+\d+)?"#, options: .regularExpression) {
+            return String(trimmed[range])
+        }
+        return trimmed
+    }
+
     /// Builds a live clock snapshot from ESPN `status` fields.
     static func parseClock(
         period: Int?,
         clock: Double?,
         displayClock: String?,
         state: String?,
-        sportPath: String
+        sportPath: String,
+        statusDetail: String? = nil
     ) -> ESPNGameClock? {
         var resolvedPeriod = period ?? 0
         let mode = clockMode(for: sportPath)
@@ -209,6 +251,11 @@ enum GameClockSyncEngine {
         if let displayClock,
            let parsed = parseClockString(displayClock),
            parsed > 0 {
+            seconds = mode == .countDown ? min(parsed, maxPeriod) : parsed
+        } else if let statusDetail,
+                  let token = extractClockToken(from: statusDetail),
+                  let parsed = parseClockString(token),
+                  parsed > 0 {
             seconds = mode == .countDown ? min(parsed, maxPeriod) : parsed
         } else if let clock, clock > 0 {
             let asInt = Int(clock.rounded())
@@ -350,14 +397,29 @@ struct TickingGameClock: Equatable, Sendable {
     private func display(for clock: ESPNGameClock) -> String {
         switch mode {
         case .countUp:
-            if clock.displayClock.contains("'") {
-                return clock.periodAndClockLabel
-            }
-            return "\(clock.periodLabel) \(GameClockSyncEngine.formatSoccerMinute(seconds: clock.clockSeconds))"
+            return formattedSoccerClock(clock)
         case .countDown:
             let maxPeriod = GameClockSyncEngine.periodLengthSeconds(sportPath: sportPath, period: clock.period)
             let remaining = min(clock.clockSeconds, maxPeriod)
             return "\(clock.periodLabel) \(GameClockSyncEngine.formatCountdownClock(seconds: remaining))"
         }
+    }
+
+    private func formattedSoccerClock(_ clock: ESPNGameClock) -> String {
+        let halfLength = 45 * 60
+        if clock.period >= 2 {
+            if clock.clockSeconds > halfLength {
+                let stoppage = (clock.clockSeconds - halfLength) / 60
+                return "\(clock.periodLabel) 90'+\(max(0, stoppage))'"
+            }
+            if clock.clockSeconds >= halfLength {
+                return "\(clock.periodLabel) 90'"
+            }
+        }
+        if clock.period <= 1, clock.clockSeconds > halfLength {
+            let stoppage = (clock.clockSeconds - halfLength) / 60
+            return "\(clock.periodLabel) 45'+\(max(0, stoppage))'"
+        }
+        return "\(clock.periodLabel) \(GameClockSyncEngine.formatSoccerMinute(seconds: clock.clockSeconds))"
     }
 }

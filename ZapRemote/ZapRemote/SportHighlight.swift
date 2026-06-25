@@ -199,21 +199,17 @@ enum SportHighlightEngine {
 
     // MARK: Precision Rewind
 
-    /// How far back the TV player should skip to land before the highlight.
-    /// ESPN timestamps are live; the user's TV feed lags by `streamDelaySeconds`.
-    /// A play at live 14:23 lands on the user's TV at ~14:31 when delay is 8s.
+    /// Universal timestamp rewind — see `TimelineOffsetEngine.rewindSeconds`.
     static func finalRewindSeconds(
         highlightDate: Date,
         streamDelaySeconds: Double,
         now: Date = Date()
     ) -> Int {
-        let tvAge = GameClockSyncEngine.ageOnUserTV(
-            livePlayDate: highlightDate,
-            now: now,
-            streamDelaySeconds: streamDelaySeconds
+        TimelineOffsetEngine.rewindSeconds(
+            highlightDate: highlightDate,
+            streamDelaySeconds: streamDelaySeconds,
+            now: now
         )
-        let rewind = tvAge + prePlayPaddingSeconds
-        return max(1, Int(rewind.rounded()))
     }
 
     // MARK: - Private
