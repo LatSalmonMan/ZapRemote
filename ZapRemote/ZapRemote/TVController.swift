@@ -92,6 +92,52 @@ enum StreamingAppSkipProfile: Sendable {
     }
 }
 
+/// YouTube TV rewind — 5-click bursts (100ms) with reset pauses, slow 10s tail for remainder.
+private enum YTTVMicroBurstSeek {
+    static let intraBurstDelayMs = 100
+    static let interBurstResetMs = 750
+    static let maxClicksPerBurst = 5
+    /// Calibrate once: fire one burst on TV, measure seconds rewound, update this knob.
+    static let secondsPerBurst = 150
+    static let tailClickSpacingMs = 500
+    static let tailSecondsPerClick = 10
+
+    struct Plan {
+        let burstCount: Int
+        let tailClicks: Int
+        let tailRemainderSeconds: Int
+        var burstClicks: Int { burstCount * maxClicksPerBurst }
+        var totalClicks: Int { burstClicks + tailClicks }
+        let estimatedCoverageSeconds: Int
+        let estimatedMacroSeconds: Int
+    }
+
+    static func plan(targetSeconds: Int) -> Plan {
+        let target = max(1, targetSeconds)
+        let burstCount = target / secondsPerBurst
+        let remainder = target - burstCount * secondsPerBurst
+        let tailClicks = remainder > 0
+            ? (remainder + tailSecondsPerClick - 1) / tailSecondsPerClick
+            : 0
+        let tailCoverage = tailClicks * tailSecondsPerClick
+
+        let intraBurstMs = max(0, maxClicksPerBurst - 1) * intraBurstDelayMs
+        let burstLoopsMs = burstCount > 0
+            ? burstCount * intraBurstMs + max(0, burstCount - 1) * interBurstResetMs
+            : 0
+        let tailMs = max(0, tailClicks - 1) * tailClickSpacingMs
+        let overheadMs = 1_850
+
+        return Plan(
+            burstCount: burstCount,
+            tailClicks: tailClicks,
+            tailRemainderSeconds: remainder,
+            estimatedCoverageSeconds: burstCount * secondsPerBurst + tailCoverage,
+            estimatedMacroSeconds: max(1, Int(ceil(Double(burstLoopsMs + tailMs + overheadMs) / 1000.0)))
+        )
+    }
+}
+
 enum TVControllerError: LocalizedError {
     case notConnected
     case pairingRequired
@@ -129,15 +175,15 @@ final class TVController: ObservableObject {
     private static let webOSPort = 3000
     private static let clientKeyStorageKey = "com.zapremote.lg.clientKey"
     private static let lastTVIPStorageKey = TVControllerStorageKey.lastTVIP
-    private static let macroClickSpacingMs = 150
+    /// Caps generic test skips and quick Go Live nudges — not highlight rewinds.
     private static let maxMacroClicks = 14
-    /// Hard cooldown held after a rewind macro's trailing PLAY command, before the
-    /// `isExecutingMacro` lock releases. Blocks duplicate triggers for 10s so the LG TV
-    /// never jams or loops network packets infinitely.
-    private static let macroCooldownSeconds: TimeInterval = 10.0
+    /// Hard cooldown after rewind — blocks duplicate triggers so the LG TV doesn't jam.
+    private static let macroCooldownSeconds: TimeInterval = 4.0
     private static let foregroundPollIntervalSeconds: UInt64 = 2
     private static let discoveryScanSeconds: UInt64 = 5
     private static let pairingTimeoutSeconds: UInt64 = 45
+    /// If LG never shows a prompt (stale client-key), clear it and register again.
+    private static let pairingStallRecoverySeconds: UInt64 = 10
 
     private let webSocketSession: URLSession
     private var mainWebSocket: URLSessionWebSocketTask?
@@ -149,7 +195,11 @@ final class TVController: ObservableObject {
     private var foregroundPollTask: Task<Void, Never>?
     private var macroSequenceTask: Task<Void, Never>?
     private var pairingTimeoutTask: Task<Void, Never>?
+    private var pairingStallRecoveryTask: Task<Void, Never>?
+    private var autoReconnectTask: Task<Void, Never>?
     private var lanDiscovery: UniversalTVBrowser?
+
+    private var autoReconnectEnabled = false
 
     private var pendingSSAPRequests: [String: CheckedContinuation<[String: Any], Error>] = [:]
     private var ssapRequestCounter = 0
@@ -157,6 +207,7 @@ final class TVController: ObservableObject {
 
     /// Exact LEFT clicks from the last rewind — mirrored for return-to-live.
     private(set) var lastRewindClickCount: Int = 0
+    private var lastRewindMacroFinishedAt: Date?
 
     /// Restores the rewind ledger after auto Go Live scheduling (ESPN resume must not zero it).
     func restoreRewindClickCount(_ count: Int) {
@@ -171,6 +222,12 @@ final class TVController: ObservableObject {
     /// `triggerRewindMacro` refuses to start while this is true.
     @Published private(set) var isExecutingMacro = false
 
+    /// Shown on the LG TV immediately before a highlight rewind macro fires.
+    private var pendingHighlightBanner: (index: Int?, total: Int?)?
+
+    /// Active persistent toast — dismissed when the highlight watch window ends.
+    private var activeHighlightToastID: String?
+
     // MARK: Init
 
     init() {
@@ -183,14 +240,38 @@ final class TVController: ObservableObject {
         savedClientKey = UserDefaults.standard.string(forKey: Self.clientKeyStorageKey)
     }
 
+    /// When enabled, dropped sockets auto-reconnect during an active game-night session.
+    func setAutoReconnectEnabled(_ enabled: Bool) {
+        autoReconnectEnabled = enabled
+        if enabled, connectionPhase == .disconnected {
+            scheduleAutoReconnect()
+        }
+        if !enabled {
+            autoReconnectTask?.cancel()
+        }
+    }
+
+    /// Heartbeat + reconnect used while automation must stay alive in the background.
+    func ensureReadyConnection() async {
+        if connectionPhase == .ready {
+            await fetchActiveAppID()
+            return
+        }
+        guard connectionPhase == .disconnected else { return }
+        await reconnectToSavedTVIfPossible()
+    }
+
     /// Reconnects to the last paired TV on the same Wi‑Fi.
     func reconnectToSavedTVIfPossible() async {
         guard connectionPhase == .disconnected else { return }
-        guard let clientKey = savedClientKey, !clientKey.isEmpty else { return }
         guard let savedIP = UserDefaults.standard.string(forKey: Self.lastTVIPStorageKey),
               !savedIP.isEmpty else { return }
 
-        statusMessage = "Reconnecting to saved TV…"
+        if let savedClientKey, !savedClientKey.isEmpty {
+            statusMessage = "Reconnecting to saved TV…"
+        } else {
+            statusMessage = "Connecting to saved TV — approve on your TV…"
+        }
         await connectToTV(ipAddress: savedIP)
     }
 
@@ -321,25 +402,57 @@ final class TVController: ObservableObject {
     ///
     /// The TV responds with `type: "registered"` and a `client-key` payload we persist
     /// in `savedClientKey` for passwordless reconnects on future launches.
-    func requestPairingKey() async {
+    func requestPairingKey(forceFresh: Bool = false) async {
         guard mainWebSocket != nil else {
             statusMessage = "Not connected — call connectToTV first."
             return
         }
 
         registerHandshakeSent = true
-        statusMessage = "Approve ZapRemote on your LG TV…"
+        let usingSavedKey = !forceFresh && savedClientKey != nil && !(savedClientKey?.isEmpty ?? true)
+        statusMessage = usingSavedKey
+            ? "Reconnecting to LG TV…"
+            : "Approve ZapRemote on your LG TV…"
 
-        var payload = Self.registrationPayload
-        if let savedClientKey, !savedClientKey.isEmpty {
-            payload["client-key"] = savedClientKey
-        }
+        let payload = Self.registrationPayload(forceFresh: forceFresh, clientKey: savedClientKey)
 
         sendSSAP(envelope: [
             "type": "register",
             "id": "register_0",
             "payload": payload
         ], on: mainWebSocket)
+
+        if usingSavedKey {
+            startPairingStallRecovery(retryForcePairing: false)
+        } else {
+            pairingStallRecoveryTask?.cancel()
+            startPairingStallRecovery(retryForcePairing: true)
+        }
+    }
+
+    /// Stale `client-key` values fail silently on some LG firmware — re-request the on-TV prompt.
+    private func startPairingStallRecovery(retryForcePairing: Bool) {
+        pairingStallRecoveryTask?.cancel()
+        pairingStallRecoveryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.pairingStallRecoverySeconds * 1_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            guard self.connectionPhase == .pairing else { return }
+
+            if retryForcePairing {
+                print("⚠️ TVController: pairing stalled — retrying with forcePairing")
+                self.registerHandshakeSent = false
+                self.statusMessage = "Approve the pairing popup on your LG TV…"
+                await self.requestPairingKey(forceFresh: true)
+                return
+            }
+
+            print("⚠️ TVController: pairing stalled — clearing saved key and re-requesting prompt")
+            self.savedClientKey = nil
+            UserDefaults.standard.removeObject(forKey: Self.clientKeyStorageKey)
+            self.registerHandshakeSent = false
+            self.statusMessage = "Approve the pairing popup on your LG TV…"
+            await self.requestPairingKey(forceFresh: false)
+        }
     }
 
     /// Phase 2 — opens the pointer-input socket after `client-key` is accepted.
@@ -371,6 +484,7 @@ final class TVController: ObservableObject {
             statusMessage = "Connected to \(host)"
             UserDefaults.standard.set(host, forKey: Self.lastTVIPStorageKey)
             pairingTimeoutTask?.cancel()
+            pairingStallRecoveryTask?.cancel()
             startForegroundAppPolling()
             await fetchActiveAppID()
 
@@ -378,6 +492,15 @@ final class TVController: ObservableObject {
                 message: "ZapRemote connected — automation is ready."
             )
         } catch {
+            if savedClientKey != nil {
+                savedClientKey = nil
+                UserDefaults.standard.removeObject(forKey: Self.clientKeyStorageKey)
+                registerHandshakeSent = false
+                connectionPhase = .pairing
+                statusMessage = "Pairing expired — approve the popup on your TV…"
+                await requestPairingKey(forceFresh: false)
+                return
+            }
             statusMessage = "Input socket failed: \(error.localizedDescription)"
             connectionPhase = .disconnected
         }
@@ -425,13 +548,15 @@ final class TVController: ObservableObject {
 
     /// Sends a calculated sequence of LEFT presses to rewind by `targetSeconds`.
     ///
-    /// Skip granularity is determined by the active streaming app's `appId`.
-    /// Clicks are spaced 120ms apart via `DispatchQueue.main.asyncAfter` to avoid
-    /// flooding the TV's input buffer.
+    /// YouTube TV uses 5-click micro-bursts; other apps use steady `clickSpacingMs` skips.
     @discardableResult
-    func triggerRewindMacro(targetSeconds: Int) -> Bool {
+    func triggerRewindMacro(
+        targetSeconds: Int,
+        highlightBannerIndex: Int? = nil,
+        highlightBannerTotal: Int? = nil
+    ) -> Bool {
         guard !isExecutingMacro else {
-            statusMessage = "Rewind already in progress — wait ~10 sec."
+            statusMessage = "Rewind already in progress — wait a few sec."
             print("🛑 TVController: triggerRewindMacro ignored — isExecutingMacro is already true")
             return false
         }
@@ -448,6 +573,7 @@ final class TVController: ObservableObject {
         }
 
         isExecutingMacro = true
+        pendingHighlightBanner = (highlightBannerIndex, highlightBannerTotal)
         runPointerMacro(direction: "LEFT", targetSeconds: targetSeconds, actionLabel: "Rewinding")
         return true
     }
@@ -463,18 +589,36 @@ final class TVController: ObservableObject {
         return nil
     }
 
+    private func usesYouTubeTVMicroBurst(for direction: String) -> Bool {
+        guard direction == "LEFT" else { return false }
+        if StreamingAppSkipProfile.profile(for: currentAppID) == .youtubeTV { return true }
+        if currentAppID.isEmpty,
+           !preferredStreamingAppID.isEmpty,
+           StreamingAppSkipProfile.profile(for: preferredStreamingAppID) == .youtubeTV {
+            return true
+        }
+        return false
+    }
+
     /// YouTube TV = 15s, Hulu/Peacock = 10s per LEFT/RIGHT skip.
     func secondsPerSkipClick() -> Int {
         resolvedSecondsPerClick() ?? 15
     }
 
     /// Rounds rewind depth up to whole skip clicks (e.g. 122s → 8×15s = 120s on YouTube TV).
-    func snappedSkipSeconds(targetSeconds: Int) -> Int {
+    func snappedSkipSeconds(targetSeconds: Int, maxClicks: Int = maxMacroClicks) -> Int {
         let secondsPerClick = secondsPerSkipClick()
         let clicks = min(
-            Self.maxMacroClicks,
+            maxClicks,
             max(1, (targetSeconds + secondsPerClick - 1) / secondsPerClick)
         )
+        return clicks * secondsPerClick
+    }
+
+    /// Highlight rewind — as many scrub clicks as the timestamp math requires (full half if needed).
+    func snappedRewindSeconds(targetSeconds: Int) -> Int {
+        let secondsPerClick = secondsPerSkipClick()
+        let clicks = max(1, (targetSeconds + secondsPerClick - 1) / secondsPerClick)
         return clicks * secondsPerClick
     }
 
@@ -484,6 +628,8 @@ final class TVController: ObservableObject {
         highlightDate: Date,
         streamDelaySeconds: Double,
         maxSeconds: Int? = nil,
+        highlightBannerIndex: Int? = nil,
+        highlightBannerTotal: Int? = nil,
         now: Date = Date()
     ) -> Bool {
         let calculated = TimelineOffsetEngine.rewindSeconds(
@@ -491,8 +637,7 @@ final class TVController: ObservableObject {
             streamDelaySeconds: streamDelaySeconds,
             now: now
         )
-        let capped = maxSeconds.map { min(calculated, $0) } ?? calculated
-        let snapped = snappedSkipSeconds(targetSeconds: capped)
+        let snapped = snappedRewindSeconds(targetSeconds: calculated)
         print(
             "⏪ TVController: universal rewind "
             + "elapsed=\(Int(now.timeIntervalSince(highlightDate)))s "
@@ -500,7 +645,11 @@ final class TVController: ObservableObject {
             + "+ lag=\(Int(streamDelaySeconds.rounded()))s "
             + "→ \(snapped)s (\(snapped / secondsPerSkipClick()) clicks)"
         )
-        return triggerRewindMacro(targetSeconds: snapped)
+        return triggerRewindMacro(
+            targetSeconds: snapped,
+            highlightBannerIndex: highlightBannerIndex,
+            highlightBannerTotal: highlightBannerTotal
+        )
     }
 
     private func resolvedClickSpacingMs() -> Int {
@@ -547,6 +696,7 @@ final class TVController: ObservableObject {
     func cancelActiveMacro() {
         macroSequenceTask?.cancel()
         macroSequenceTask = nil
+        pendingHighlightBanner = nil
         isMacroRunning = false
         isExecutingMacro = false
     }
@@ -554,7 +704,8 @@ final class TVController: ObservableObject {
     // MARK: 5b — THE "JUMP TO LIVE" RESET MACRO
 
     /// Returns to the live edge — re-opens the YTTV scrub bar, then RIGHT-clicks forward.
-    func executeGoLiveMacro() async {
+    /// Pass `forwardClicks` when the caller computed drift-aware catch-up (multi-highlight breaks).
+    func executeGoLiveMacro(forwardClicks overrideClicks: Int? = nil) async {
         guard connectionPhase == .ready, pointerWebSocket != nil else {
             statusMessage = "Connect to the TV before jumping to live."
             return
@@ -562,7 +713,19 @@ final class TVController: ObservableObject {
 
         cancelActiveMacro()
 
-        let clicks = lastRewindClickCount
+        let secondsPerClick = resolvedSecondsPerClick() ?? 15
+        let clicks: Int
+        if let override = overrideClicks, override > 0 {
+            clicks = override
+        } else {
+            var base = lastRewindClickCount
+            if let finishedAt = lastRewindMacroFinishedAt {
+                let drift = Int(ceil(Date().timeIntervalSince(finishedAt) / Double(secondsPerClick)))
+                base += drift
+            }
+            clicks = min(Self.maxMacroClicks, max(1, base + 2))
+        }
+
         guard clicks > 0 else {
             statusMessage = "Nothing to undo — tap Ad on my TV first, then Go Live."
             return
@@ -601,20 +764,21 @@ final class TVController: ObservableObject {
         sendPointerButton("ENTER")
 
         lastRewindClickCount = 0
+        lastRewindMacroFinishedAt = nil
         isExecutingMacro = false
         statusMessage = "Returned to live — \(clicks)× forward, confirmed."
     }
 
-    /// Waits for an in-flight macro and the post-skip settle window.
+    /// Waits for an in-flight macro and a short post-skip settle window.
     func waitForMacroCycleToFinish() async {
         while isMacroRunning || isExecutingMacro {
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
-        try? await Task.sleep(nanoseconds: 4_000_000_000)
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
     }
 
     /// Skips forward on the DVR scrub bar — decrements the live-edge ledger per click.
-    func skipForwardOnScrubBar(targetSeconds: Int) async -> Bool {
+    func skipForwardOnScrubBar(targetSeconds: Int, unlimitedClicks: Bool = false) async -> Bool {
         guard connectionPhase == .ready, pointerWebSocket != nil else {
             statusMessage = "Connect to the TV before skipping forward."
             return false
@@ -622,11 +786,10 @@ final class TVController: ObservableObject {
         guard !isMacroRunning, !isExecutingMacro else { return false }
         guard let secondsPerClick = resolvedSecondsPerClick() else { return false }
 
-        let totalClicks = min(
-            Self.maxMacroClicks,
-            max(1, (targetSeconds + secondsPerClick - 1) / secondsPerClick)
-        )
-        guard totalClicks > 0 else { return true }
+        let cappedSeconds = unlimitedClicks
+            ? targetSeconds
+            : min(targetSeconds, Self.maxMacroClicks * secondsPerClick)
+        guard cappedSeconds > 0 else { return true }
 
         guard await refreshPointerInputSocket() else {
             statusMessage = "TV input channel lost — tap Reset and reconnect."
@@ -641,8 +804,16 @@ final class TVController: ObservableObject {
         sendPointerButton("LEFT")
         try? await Task.sleep(for: .milliseconds(550))
 
+        let totalClicks = unlimitedClicks
+            ? max(1, (cappedSeconds + secondsPerClick - 1) / secondsPerClick)
+            : min(
+                Self.maxMacroClicks,
+                max(1, (cappedSeconds + secondsPerClick - 1) / secondsPerClick)
+            )
+
         let spacingMs = resolvedClickSpacingMs()
         for index in 0..<totalClicks {
+            guard !Task.isCancelled, connectionPhase == .ready else { return false }
             sendPointerButton("RIGHT")
             lastRewindClickCount = max(0, lastRewindClickCount - 1)
             if index < totalClicks - 1 {
@@ -656,34 +827,57 @@ final class TVController: ObservableObject {
     }
 
     private func runPointerMacro(direction: String, targetSeconds: Int, actionLabel: String) {
-        guard let secondsPerClick = resolvedSecondsPerClick() else {
+        guard resolvedSecondsPerClick() != nil else {
             statusMessage = "Macro disabled — open a supported streaming app on your TV."
             releaseProcessingMacroLock(direction: direction)
             return
         }
 
-        let totalClicks = min(
-            Self.maxMacroClicks,
-            max(1, (targetSeconds + secondsPerClick - 1) / secondsPerClick)
-        )
+        let totalClicks: Int
+        let statusLabel: String
+        if usesYouTubeTVMicroBurst(for: direction) {
+            let plan = YTTVMicroBurstSeek.plan(targetSeconds: targetSeconds)
+            totalClicks = plan.totalClicks
+            if plan.burstCount > 0 {
+                statusLabel = "\(actionLabel) \(targetSeconds)s (\(plan.burstCount)× burst + \(plan.tailClicks) tail, ~\(plan.estimatedMacroSeconds)s)…"
+            } else {
+                statusLabel = "\(actionLabel) \(targetSeconds)s (\(plan.tailClicks)× tail, ~\(plan.estimatedMacroSeconds)s)…"
+            }
+        } else {
+            let secondsPerClick = resolvedSecondsPerClick()!
+            if direction == "LEFT" {
+                totalClicks = max(1, (targetSeconds + secondsPerClick - 1) / secondsPerClick)
+            } else {
+                totalClicks = min(
+                    Self.maxMacroClicks,
+                    max(1, (targetSeconds + secondsPerClick - 1) / secondsPerClick)
+                )
+            }
+            statusLabel = "\(actionLabel) (\(totalClicks)× \(direction))…"
+        }
+
         guard totalClicks > 0 else {
-            statusMessage = "Target too small for \(secondsPerClick)s skip increments."
+            statusMessage = "Target too small for skip increments."
             releaseProcessingMacroLock(direction: direction)
             return
         }
 
         runPointerMacro(
             direction: direction,
+            targetSeconds: targetSeconds,
             totalClicks: totalClicks,
             actionLabel: actionLabel,
+            statusLabel: statusLabel,
             clearsRewindLedger: false
         )
     }
 
     private func runPointerMacro(
         direction: String,
+        targetSeconds: Int,
         totalClicks: Int,
         actionLabel: String,
+        statusLabel: String,
         clearsRewindLedger: Bool
     ) {
         guard connectionPhase == .ready, pointerWebSocket != nil else {
@@ -700,11 +894,12 @@ final class TVController: ObservableObject {
 
         macroSequenceTask?.cancel()
         isMacroRunning = true
-        statusMessage = "\(actionLabel) (\(totalClicks)× \(direction))…"
+        statusMessage = statusLabel
 
         macroSequenceTask = Task { [weak self] in
             await self?.executeMacroClickSequence(
                 direction: direction,
+                targetSeconds: targetSeconds,
                 totalClicks: totalClicks,
                 actionLabel: actionLabel,
                 clearsRewindLedger: clearsRewindLedger
@@ -714,6 +909,7 @@ final class TVController: ObservableObject {
 
     private func executeMacroClickSequence(
         direction: String,
+        targetSeconds: Int,
         totalClicks: Int,
         actionLabel: String,
         clearsRewindLedger: Bool
@@ -728,10 +924,20 @@ final class TVController: ObservableObject {
             return
         }
 
-        // Center click focuses the video surface without sending DOWN (which browses the grid).
         if direction == "LEFT" {
+            pendingHighlightBanner = nil
             sendPointerClick()
             try? await Task.sleep(for: .milliseconds(450))
+        }
+
+        if usesYouTubeTVMicroBurst(for: direction) {
+            await executeMicroBurstRewind(
+                targetSeconds: targetSeconds,
+                totalClicks: totalClicks,
+                actionLabel: actionLabel,
+                clearsRewindLedger: clearsRewindLedger
+            )
+            return
         }
 
         let spacingMs = resolvedClickSpacingMs()
@@ -758,9 +964,12 @@ final class TVController: ObservableObject {
             lastRewindClickCount = 0
         }
 
-        // Confirm the scrub position and resume playback (YouTube TV needs OK after skips).
         try? await Task.sleep(for: .milliseconds(400))
         sendPointerButton("ENTER")
+
+        if direction == "LEFT" {
+            lastRewindMacroFinishedAt = Date()
+        }
 
         statusMessage = "\(actionLabel) complete — \(totalClicks)× \(direction), confirmed."
 
@@ -768,6 +977,79 @@ final class TVController: ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.macroCooldownSeconds) { [weak self] in
                 self?.isExecutingMacro = false
             }
+        }
+    }
+
+    /// 5 rapid LEFT clicks → reset pause → repeat; slow 10s tail for the remainder.
+    private func executeMicroBurstRewind(
+        targetSeconds: Int,
+        totalClicks: Int,
+        actionLabel: String,
+        clearsRewindLedger: Bool
+    ) async {
+        let plan = YTTVMicroBurstSeek.plan(targetSeconds: targetSeconds)
+        print(
+            "⏪ YTTV micro-burst \(targetSeconds)s → "
+            + "\(plan.burstCount)×\(YTTVMicroBurstSeek.maxClicksPerBurst) "
+            + "+ tail \(plan.tailClicks)×\(YTTVMicroBurstSeek.tailSecondsPerClick)s "
+            + "(coverage ~\(plan.estimatedCoverageSeconds)s, ~\(plan.estimatedMacroSeconds)s)"
+        )
+
+        var sent = 0
+
+        for burstIndex in 0..<plan.burstCount {
+            guard !Task.isCancelled, connectionPhase == .ready else {
+                releaseProcessingMacroLock(direction: "LEFT")
+                return
+            }
+
+            for clickIndex in 0..<YTTVMicroBurstSeek.maxClicksPerBurst {
+                guard !Task.isCancelled, connectionPhase == .ready else {
+                    releaseProcessingMacroLock(direction: "LEFT")
+                    return
+                }
+                sendPointerButton("LEFT")
+                sent += 1
+                lastRewindClickCount = sent
+                if clickIndex < YTTVMicroBurstSeek.maxClicksPerBurst - 1 {
+                    try? await Task.sleep(for: .milliseconds(YTTVMicroBurstSeek.intraBurstDelayMs))
+                }
+            }
+
+            if burstIndex < plan.burstCount - 1 {
+                try? await Task.sleep(for: .milliseconds(YTTVMicroBurstSeek.interBurstResetMs))
+            }
+        }
+
+        if plan.burstCount > 0, plan.tailClicks > 0 {
+            try? await Task.sleep(for: .milliseconds(YTTVMicroBurstSeek.interBurstResetMs))
+        }
+
+        for index in 0..<plan.tailClicks {
+            guard !Task.isCancelled, connectionPhase == .ready else {
+                releaseProcessingMacroLock(direction: "LEFT")
+                return
+            }
+            sendPointerButton("LEFT")
+            sent += 1
+            lastRewindClickCount = sent
+            if index < plan.tailClicks - 1 {
+                try? await Task.sleep(for: .milliseconds(YTTVMicroBurstSeek.tailClickSpacingMs))
+            }
+        }
+
+        if clearsRewindLedger {
+            lastRewindClickCount = 0
+        }
+
+        try? await Task.sleep(for: .milliseconds(400))
+        sendPointerButton("ENTER")
+
+        lastRewindMacroFinishedAt = Date()
+        statusMessage = "\(actionLabel) complete — \(totalClicks)× LEFT, confirmed."
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.macroCooldownSeconds) { [weak self] in
+            self?.isExecutingMacro = false
         }
     }
 
@@ -837,6 +1119,67 @@ final class TVController: ObservableObject {
 
     // MARK: 6 — On-Screen Toast Banner (LG webOS SSAP)
 
+    /// Persistent on-TV chip — updates each highlight (1/4, 2/4, …) and stays until reel ends.
+    func updateHighlightReelBanner(index: Int, total: Int) async {
+        let message: String
+        if total > 1 {
+            message = "⚡ ZapRemote · Highlight \(index)/\(total)"
+        } else {
+            message = "⚡ ZapRemote · Highlight"
+        }
+
+        if activeHighlightToastID != nil {
+            await dismissHighlightSessionBanner()
+        }
+
+        activeHighlightToastID = await createPersistentToast(message: message)
+        if activeHighlightToastID != nil {
+            statusMessage = message
+        } else {
+            print("⚠️ TVController: highlight banner failed — check TV is connected")
+        }
+    }
+
+    func endHighlightReelBanner() async {
+        await dismissHighlightSessionBanner()
+    }
+
+    /// @deprecated — use `updateHighlightReelBanner(index:total:)`
+    func beginHighlightReelBanner() async {
+        await updateHighlightReelBanner(index: 1, total: 1)
+    }
+
+    /// Persistent on-TV chip for a single manual skip (non-reel).
+    func showHighlightSessionBanner(index: Int, total: Int) async {
+        await dismissHighlightSessionBanner()
+        let message = total > 1
+            ? "ZapRemote · Highlight \(index)/\(total)"
+            : "ZapRemote · Highlight"
+        activeHighlightToastID = await createPersistentToast(message: message)
+        if activeHighlightToastID == nil {
+            print("⚠️ TVController: highlight toast create failed — check TV is connected")
+        } else {
+            statusMessage = "Highlight on TV — \(message)"
+        }
+    }
+
+    func dismissHighlightSessionBanner() async {
+        guard let toastID = activeHighlightToastID else { return }
+        activeHighlightToastID = nil
+        await closeLGToast(id: toastID)
+    }
+
+    /// Short on-TV banner while skipping to a highlight (legacy one-shot).
+    func showHighlightRewindBanner(index: Int? = nil, total: Int? = nil) async {
+        let message: String
+        if let index, let total, total > 1 {
+            message = "ZapRemote · Highlight \(index)/\(total)"
+        } else {
+            message = "ZapRemote · Highlight"
+        }
+        _ = await createPersistentToast(message: message)
+    }
+
     /// Pushes an on-screen toast banner to the paired LG TV.
     ///
     /// LG webOS notification protocol (main WebSocket port 3000):
@@ -856,54 +1199,118 @@ final class TVController: ObservableObject {
     /// 3. `iconData` accepts a base64-encoded image string when we add custom toast icons.
     /// 4. TV renders the toast overlay; response arrives on the same socket with matching `id`.
     func sendLGTVToastNotification(message: String) async {
+        _ = await createPersistentToast(message: message)
+    }
+
+    private func createPersistentToast(message: String) async -> String? {
         guard isConnected, mainWebSocket != nil else {
             statusMessage = "Notification failed: TV disconnected"
-            print("❌ sendLGTVToastNotification failed — TV not connected (phase: \(connectionPhase))")
-            return
+            print("❌ createPersistentToast failed — TV not connected (phase: \(connectionPhase))")
+            return nil
         }
 
         let trimmedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedMessage.isEmpty else {
-            statusMessage = "Notification failed: empty message"
-            print("❌ sendLGTVToastNotification failed — message was empty")
+        guard !trimmedMessage.isEmpty else { return nil }
+
+        let payloadVariants: [[String: Any]] = [
+            ["message": trimmedMessage, "persistent": true, "noaction": true],
+            ["message": trimmedMessage, "persistent": true],
+            ["message": trimmedMessage, "iconData": ""]
+        ]
+        let uriVariants = [
+            "system.notifications/createToast",
+            "com.webos.notification/createToast"
+        ]
+
+        for uri in uriVariants {
+            for payload in payloadVariants {
+                if let toastID = await requestToastID(uri: uri, payload: payload) {
+                    print("LG TV toast created (\(uri)): \(trimmedMessage) id=\(toastID)")
+                    return toastID
+                }
+            }
+        }
+
+        statusMessage = "Connected, but TV toast failed"
+        print("❌ createPersistentToast failed for all URI/payload variants")
+        return nil
+    }
+
+    private func requestToastID(uri: String, payload: [String: Any]) async -> String? {
+        do {
+            let response = try await ssapRequest(uri: uri, payload: payload, on: mainWebSocket)
+            return parseToastID(from: response) ?? Self.legacyToastToken
+        } catch {
+            return nil
+        }
+    }
+
+    private static let legacyToastToken = "__zapremote_toast__"
+
+    private func parseToastID(from response: [String: Any]) -> String? {
+        for key in ["toastId", "toastID", "id", "notificationId"] {
+            if let value = response[key] as? String, !value.isEmpty {
+                return value
+            }
+        }
+        if let returnValue = response["returnValue"] as? [String: Any] {
+            return parseToastID(from: returnValue)
+        }
+        return nil
+    }
+
+    private func closeLGToast(id: String) async {
+        guard isConnected, mainWebSocket != nil else { return }
+
+        if id == Self.legacyToastToken {
+            await closeAllLGToasts()
             return
         }
 
-        // LG `createToast` payload — `iconData` reserved for future base64 artwork injection.
-        let toastPayload: [String: Any] = [
-            "message": trimmedMessage,
-            "iconData": ""
+        let uriVariants = [
+            "com.webos.notification/closeToast",
+            "system.notifications/closeToast"
+        ]
+        let payloadVariants: [[String: Any]] = [
+            ["id": id],
+            ["toastId": id]
         ]
 
-        do {
-            _ = try await ssapRequest(
-                uri: "system.notifications/createToast",
-                payload: toastPayload,
-                on: mainWebSocket
-            )
-            print("LG TV Notification Successfully Pushed: \(trimmedMessage)")
-            statusMessage = "Connected — toast sent to TV"
-        } catch {
-            // Some firmware builds use the older notification service path.
+        for uri in uriVariants {
+            for payload in payloadVariants {
+                do {
+                    _ = try await ssapRequest(uri: uri, payload: payload, on: mainWebSocket)
+                    print("LG TV toast dismissed (\(uri)): \(id)")
+                    return
+                } catch {
+                    continue
+                }
+            }
+        }
+        print("⚠️ TVController: could not dismiss toast \(id)")
+    }
+
+    private func closeAllLGToasts() async {
+        let uriVariants = [
+            "com.webos.notification/closeAll",
+            "system.notifications/closeAll"
+        ]
+        for uri in uriVariants {
             do {
-                _ = try await ssapRequest(
-                    uri: "com.webos.notification/createToast",
-                    payload: toastPayload,
-                    on: mainWebSocket
-                )
-                print("LG TV Notification Successfully Pushed (fallback URI): \(trimmedMessage)")
-                statusMessage = "Connected — toast sent to TV"
+                _ = try await ssapRequest(uri: uri, payload: [:], on: mainWebSocket)
+                print("LG TV toasts cleared (\(uri))")
+                return
             } catch {
-                let errorText = error.localizedDescription
-                statusMessage = "Connected, but TV toast failed: \(errorText)"
-                print("❌ sendLGTVToastNotification network error: \(errorText)")
+                continue
             }
         }
     }
 
-    /// Sends a short test banner to the TV so you can confirm pairing + notifications work.
+    /// Sends a short test banner on TV — same chip as the highlight reel.
     func sendTestTVNotification() async {
-        await sendLGTVToastNotification(message: "ZapRemote test — if you see this, TV alerts work.")
+        await updateHighlightReelBanner(index: 1, total: 1)
+        try? await Task.sleep(nanoseconds: 5_000_000_000)
+        await endHighlightReelBanner()
     }
 
     /// Legacy alias — forwards to `sendLGTVToastNotification(message:)`.
@@ -947,11 +1354,15 @@ final class TVController: ObservableObject {
     // MARK: Teardown
 
     func disconnect() async {
+        await dismissHighlightSessionBanner()
+
         macroSequenceTask?.cancel()
         foregroundPollTask?.cancel()
         receiveLoopTask?.cancel()
         pointerReceiveLoopTask?.cancel()
         pairingTimeoutTask?.cancel()
+        pairingStallRecoveryTask?.cancel()
+        activeHighlightToastID = nil
 
         lanDiscovery?.stopDiscovery()
         lanDiscovery = nil
@@ -1006,8 +1417,21 @@ final class TVController: ObservableObject {
                 if let error {
                     self?.statusMessage = error.localizedDescription
                     self?.connectionPhase = .disconnected
+                    self?.scheduleAutoReconnect()
                 }
             }
+        }
+    }
+
+    private func scheduleAutoReconnect() {
+        guard autoReconnectEnabled else { return }
+        autoReconnectTask?.cancel()
+        autoReconnectTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            guard self.autoReconnectEnabled, self.connectionPhase == .disconnected else { return }
+            print("🔄 TVController: auto-reconnecting to saved TV…")
+            await self.reconnectToSavedTVIfPossible()
         }
     }
 
@@ -1056,6 +1480,7 @@ final class TVController: ObservableObject {
                 if !Task.isCancelled {
                     statusMessage = "Socket closed: \(error.localizedDescription)"
                     connectionPhase = .disconnected
+                    scheduleAutoReconnect()
                 }
                 break
             }
@@ -1063,10 +1488,13 @@ final class TVController: ObservableObject {
     }
 
     private func handleIncomingSSAP(_ json: [String: Any]) {
+        let messageID = json["id"] as? String
+        let messageType = json["type"] as? String
+
         // Complete pending request/response pairs.
-        if let id = json["id"] as? String,
-           let continuation = pendingSSAPRequests.removeValue(forKey: id) {
-            if let type = json["type"] as? String, type == "error" {
+        if let messageID,
+           let continuation = pendingSSAPRequests.removeValue(forKey: messageID) {
+            if messageType == "error" {
                 let message = (json["error"] as? String) ?? "SSAP error"
                 continuation.resume(throwing: NSError(
                     domain: "ZapRemote.SSAP",
@@ -1079,27 +1507,48 @@ final class TVController: ObservableObject {
             return
         }
 
-        if let type = json["type"] as? String, type == "hello" {
+        // Some LG firmware delivers register results as `response` + `register_0`.
+        if messageID == "register_0",
+           let payload = json["payload"] as? [String: Any] {
+            if let clientKey = payload["client-key"] as? String {
+                completePairingRegistration(clientKey: clientKey)
+                return
+            }
+            if payload["pairingType"] as? String == "PROMPT" {
+                pairingStallRecoveryTask?.cancel()
+                statusMessage = "Approve ZapRemote on your LG TV…"
+                return
+            }
+        }
+
+        if messageType == "hello" {
             Task { await requestPairingKey() }
             return
         }
 
-        if let type = json["type"] as? String, type == "registered",
+        if messageType == "registered",
            let payload = json["payload"] as? [String: Any],
            let clientKey = payload["client-key"] as? String {
-            savedClientKey = clientKey
-            UserDefaults.standard.set(clientKey, forKey: Self.clientKeyStorageKey)
-            Task { await openPointerInputSocket() }
+            completePairingRegistration(clientKey: clientKey)
+            return
+        }
+
+        if messageType == "response",
+           let payload = json["payload"] as? [String: Any],
+           payload["pairingType"] as? String == "PROMPT" {
+            pairingStallRecoveryTask?.cancel()
+            statusMessage = "Approve ZapRemote on your LG TV…"
             return
         }
 
         if let payload = json["payload"] as? [String: Any],
            payload["pairingType"] as? String == "PROMPT" {
+            pairingStallRecoveryTask?.cancel()
             statusMessage = "Approve ZapRemote on your LG TV…"
             return
         }
 
-        if let type = json["type"] as? String, type == "error" {
+        if messageType == "error" {
             let message = (json["error"] as? String) ?? "LG pairing failed."
             print("❌ TVController SSAP error: \(message)")
 
@@ -1108,13 +1557,20 @@ final class TVController: ObservableObject {
                 UserDefaults.standard.removeObject(forKey: Self.clientKeyStorageKey)
                 registerHandshakeSent = false
                 statusMessage = "Old pairing expired — approve the new prompt on your TV…"
-                Task { await requestPairingKey() }
+                Task { await requestPairingKey(forceFresh: false) }
                 return
             }
 
             statusMessage = message
             connectionPhase = .disconnected
         }
+    }
+
+    private func completePairingRegistration(clientKey: String) {
+        pairingStallRecoveryTask?.cancel()
+        savedClientKey = clientKey
+        UserDefaults.standard.set(clientKey, forKey: Self.clientKeyStorageKey)
+        Task { await openPointerInputSocket() }
     }
 
     // MARK: - Helpers
@@ -1150,8 +1606,23 @@ final class TVController: ObservableObject {
         "2DXzdKX9NmmyqzJ3o/0lkk/N97gfVRLW5hA29yeAwaCViZNCP8iC9aO0q9fQoj" +
         "oa7NQnAtw=="
 
-    private static let registrationPayload: [String: Any] = [
-        "forcePairing": false,
+    private static func registrationPayload(forceFresh: Bool, clientKey: String?) -> [String: Any] {
+        var payload = baseRegistrationPayload
+        let canReuseKey = !forceFresh && clientKey != nil && !(clientKey?.isEmpty ?? true)
+        if canReuseKey, let clientKey {
+            payload["forcePairing"] = false
+            payload["client-key"] = clientKey
+        } else if forceFresh {
+            // Only used after a stale saved key — some TVs require an explicit re-pair.
+            payload["forcePairing"] = true
+        } else {
+            // First-time pairing — must stay false or many LG TVs never show the prompt.
+            payload["forcePairing"] = false
+        }
+        return payload
+    }
+
+    private static let baseRegistrationPayload: [String: Any] = [
         "pairingType": "PROMPT",
         "manifest": [
             "appVersion": "1.1",

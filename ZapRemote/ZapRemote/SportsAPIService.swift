@@ -204,7 +204,10 @@ private enum ESPNBreakClassifier {
         "half-time",
         "status_half",
         "end of period",
-        "tv timeout"
+        "tv timeout",
+        "hydration",
+        "water break",
+        "cooling break"
     ]
 
     private static let activePlayKeywords = [
@@ -218,7 +221,13 @@ private enum ESPNBreakClassifier {
         "touchdown",
         "interception",
         "fumble",
-        "sack"
+        "sack",
+        "shot on",
+        "corner kick",
+        "free kick",
+        "goal kick",
+        "cross",
+        "header"
     ]
 
     static func isCommercialBreak(status: ESPNEventStatus?, latestPlay: ESPNPlay?) -> Bool {
@@ -288,6 +297,48 @@ private enum ESPNBreakClassifier {
         ]
         .compactMap { $0?.lowercased() }
         .joined(separator: " ")
+    }
+
+    /// Soccer: hands-free only on confirmed halftime — not hydration, timeouts, or end-of-period blips.
+    static func isHandsFreeCommercialBreak(
+        status: ESPNEventStatus?,
+        latestPlay: ESPNPlay?,
+        sportPath: String
+    ) -> Bool {
+        guard isCommercialBreak(status: status, latestPlay: latestPlay) else { return false }
+
+        let path = sportPath.lowercased()
+        guard path.contains("soccer") || path.contains("fifa") else { return true }
+
+        var haystack = ""
+        if let status {
+            let typeName = status.type.name.uppercased()
+            if typeName == "STATUS_HALFTIME" || typeName == "STATUS_INTERMISSION" {
+                return true
+            }
+            haystack += [
+                status.type.description,
+                status.type.detail,
+                status.type.shortDetail,
+                status.detail,
+                status.shortDetail,
+                status.type.name
+            ]
+            .compactMap { $0?.lowercased() }
+            .joined(separator: " ")
+        }
+        if let latestPlay {
+            haystack += " " + playHaystack(latestPlay)
+        }
+
+        if haystack.contains("halftime") || haystack.contains("half time") || haystack.contains("half-time") {
+            return true
+        }
+        if haystack.contains("end of half") || haystack.contains("end of 1st half") || haystack.contains("end of first half") {
+            return true
+        }
+
+        return false
     }
 }
 
@@ -367,29 +418,36 @@ final class SportsAPIService: ObservableObject {
     /// UI + sync gate — `true` only after ESPN play log confirms real kickoff.
     @Published private(set) var isMatchPhysicallyActive: Bool = false
 
+    /// Bypass kickoff / live gates — synthetic clock + rewinds for off-air testing.
+    @Published private(set) var isNonLiveTestModeEnabled: Bool = false
+
     /// VOD / replay / finished — no live tick; user sets `streamDelaySeconds` only.
     var isReplayOffsetMode: Bool {
         hasMonitoredGame && !isTrackedGameLive
     }
 
-    /// Live (post-kickoff) or replay offset calibration.
+    /// Match Clock (live sync) vs TV Delay (replay offset only).
+    var usesLiveStyleMatchClock: Bool {
+        isTrackedGameLive || isNonLiveTestModeEnabled
+    }
+
+    /// ESPN wall-clock highlight math only works during a live broadcast.
+    var supportsTimestampHighlightRewinds: Bool {
+        isTrackedGameLive && !isReplayOffsetMode
+    }
+
+    /// Match clock + TV offset tuning.
     var allowsStreamOffsetCalibration: Bool {
-        isReplayOffsetMode || (isTrackedGameLive && isMatchPhysicallyActive)
+        guard hasMonitoredGame else { return false }
+        if isReplayOffsetMode || isTrackedGameLive { return true }
+        return matchElapsedBaseCapturedAt != nil
     }
 
-    /// When on, ESPN stoppages + cloud `ad_start` trigger the skip macro automatically.
-    @Published var isHandsFreeAutomationEnabled: Bool = true {
-        didSet {
-            UserDefaults.standard.set(isHandsFreeAutomationEnabled, forKey: SportsAPIStorageKey.handsFreeAutomation)
-        }
-    }
+    /// Always on — hands-free is the product, not a setting.
+    var isHandsFreeAutomationEnabled: Bool { true }
 
-    /// After a highlight skip, wait then auto Go Live so you can verify the rewind worked.
-    @Published var autoReturnToLiveAfterHighlight: Bool = true {
-        didSet {
-            UserDefaults.standard.set(autoReturnToLiveAfterHighlight, forKey: SportsAPIStorageKey.autoReturnToLiveAfterHighlight)
-        }
-    }
+    /// Auto Go Live when the highlight reel finishes — core product behavior.
+    @Published private(set) var autoReturnToLiveAfterHighlight: Bool = true
 
     // MARK: Spec State
 
@@ -402,13 +460,11 @@ final class SportsAPIService: ObservableObject {
     private weak var tvController: TVController?
     private var pollingTimer: Timer?
     private var matchClockUITimer: Timer?
-    private let pollIntervalSeconds: TimeInterval = 4
+    private let pollIntervalSeconds: TimeInterval = 2
     /// Typical NFL timeout / ad-pod length on linear TV — fallback when no plays parse.
     private let commercialBreakSeconds: Double = 150
     /// Caps generic TV skip macros when no ESPN highlight is available.
     private let maxGenericSkipSeconds = 120
-    /// Caps highlight-targeted skips — longer rewinds are OK when ESPN picks a real play.
-    private let maxHighlightSkipSeconds = 210
     private var lastBreakPlayID: String?
     private var scheduledReturnToLiveTask: Task<Void, Never>?
     /// ESPN game-time base — elapsed seconds in the match when `matchElapsedBaseCapturedAt` was set.
@@ -421,6 +477,15 @@ final class SportsAPIService: ObservableObject {
     @Published private(set) var pendingAutoGoLive = false
     /// Seconds to watch the highlight after the skip macro — longer for big plays.
     private let baseHighlightWatchSeconds: TimeInterval = 45
+
+    /// Tracks how far behind TV live we are during a commercial-break highlight session.
+    private var activeBreakStartedAt: Date?
+    private var activeBreakInitialRewindSeconds: Int = 0
+    private var currentBehindSeconds: Int = 0
+    private var behindPositionUpdatedAt: Date?
+    private var lastSummaryPollAt: Date?
+    private var consecutiveBreakPolls = 0
+    private let minBreakPollsBeforeAutoSkip = 2
 
     private static let iso8601Standard: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -449,7 +514,7 @@ final class SportsAPIService: ObservableObject {
         }
 
         hasSyncedStreamLag = UserDefaults.standard.bool(forKey: SportsAPIStorageKey.hasSyncedStreamLag)
-            || streamDelaySeconds != 0
+            && !gameID.isEmpty
 
         let storedGameID = UserDefaults.standard.string(forKey: SportsAPIStorageKey.monitoredGameID) ?? ""
         gameID = storedGameID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -461,23 +526,18 @@ final class SportsAPIService: ObservableObject {
 
         monitoredGameLabel = UserDefaults.standard.string(forKey: SportsAPIStorageKey.monitoredGameLabel) ?? ""
 
-        if UserDefaults.standard.object(forKey: SportsAPIStorageKey.handsFreeAutomation) != nil {
-            isHandsFreeAutomationEnabled = UserDefaults.standard.bool(
-                forKey: SportsAPIStorageKey.handsFreeAutomation
-            )
-        }
-
-        if UserDefaults.standard.object(forKey: SportsAPIStorageKey.autoReturnToLiveAfterHighlight) != nil {
-            autoReturnToLiveAfterHighlight = UserDefaults.standard.bool(
-                forKey: SportsAPIStorageKey.autoReturnToLiveAfterHighlight
-            )
-        }
-
         if UserDefaults.standard.object(forKey: SportsAPIStorageKey.monitoredGameIsLive) != nil {
             isTrackedGameLive = UserDefaults.standard.bool(forKey: SportsAPIStorageKey.monitoredGameIsLive)
         }
 
         restoreMatchElapsedClockIfNeeded()
+
+        isNonLiveTestModeEnabled = UserDefaults.standard.bool(forKey: SportsAPIStorageKey.nonLiveTestMode)
+        if isNonLiveTestModeEnabled, hasMonitoredGame {
+            activateNonLiveTestSession()
+        } else if hasMonitoredGame, isTrackedGameLive, matchElapsedBaseCapturedAt == nil {
+            startLocalMatchClock(atSeconds: 0)
+        }
     }
 
     deinit {
@@ -553,18 +613,145 @@ final class SportsAPIService: ObservableObject {
         isTrackedGameLive = result.isLive
         UserDefaults.standard.set(result.isLive, forKey: SportsAPIStorageKey.monitoredGameIsLive)
         liveGameClockLabel = result.isLive ? Self.kickoffWaitClockDisplay : "Replay"
-        hasSyncedStreamLag = streamDelaySeconds != 0
+        resetBreakSkipLatch()
+        hasSyncedStreamLag = false
+        UserDefaults.standard.set(false, forKey: SportsAPIStorageKey.hasSyncedStreamLag)
 
         stopGamePolling()
         startGamePolling()
+
+        if result.isLive {
+            Task { await bootstrapClockFromScoreboard() }
+        }
+
+        if isNonLiveTestModeEnabled {
+            startLocalMatchClock(atSeconds: 0)
+            hasSyncedStreamLag = true
+            UserDefaults.standard.set(true, forKey: SportsAPIStorageKey.hasSyncedStreamLag)
+        } else if !result.isLive {
+            isMatchPhysicallyActive = false
+            liveGameClockLabel = "Replay"
+        }
+    }
+
+    // MARK: - Local match clock (always available)
+
+    /// Starts (or restarts) the ticking match clock at `atSeconds` — no kickoff or live feed required.
+    func startLocalMatchClock(atSeconds seconds: Int = 0) {
+        guard hasMonitoredGame else { return }
+        isMatchPhysicallyActive = true
+        isMatchClockPaused = false
+        let now = Self.alignedToWholeSecond(Date())
+        matchElapsedBaseSeconds = max(0, seconds)
+        matchElapsedBaseCapturedAt = now
+        persistMatchElapsedClock()
+        startMatchClockUITimer()
+        liveGameClockLabel = formatElapsedClock(matchElapsedBaseSeconds)
+    }
+
+    /// Shifts the ESPN match clock +/− (sets game time directly, TV line follows via offset).
+    func nudgeESPNMatchClock(by seconds: Int, at date: Date = Date()) {
+        guard seconds != 0, hasMonitoredGame else { return }
+        if matchElapsedBaseCapturedAt == nil {
+            startLocalMatchClock(atSeconds: 0)
+        }
+        let current = espnElapsedSeconds(at: date) ?? matchElapsedBaseSeconds
+        let next = max(0, current + seconds)
+        let now = Self.alignedToWholeSecond(Date())
+        matchElapsedBaseSeconds = next
+        matchElapsedBaseCapturedAt = now
+        isMatchPhysicallyActive = true
+        persistMatchElapsedClock()
+        startMatchClockUITimer()
+        liveGameClockLabel = formatElapsedClock(next)
+        markOffsetCalibrationInProgress()
+    }
+
+    func canNudgeESPNMatchClock(by seconds: Int, at date: Date = Date()) -> Bool {
+        guard seconds != 0, hasMonitoredGame else { return false }
+        if seconds < 0 {
+            let current = espnElapsedSeconds(at: date) ?? matchElapsedBaseSeconds
+            return current + seconds >= 0
+        }
+        return true
+    }
+
+    // MARK: - Non-live test mode
+
+    func setNonLiveTestModeEnabled(_ enabled: Bool) {
+        guard enabled != isNonLiveTestModeEnabled else { return }
+        isNonLiveTestModeEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: SportsAPIStorageKey.nonLiveTestMode)
+
+        if enabled {
+            activateNonLiveTestSession()
+            appendActivity("Non-live test mode on — synthetic clock, rewinds unlocked")
+        } else {
+            if !isTrackedGameLive {
+                isMatchPhysicallyActive = false
+                clearMatchElapsedClock()
+                liveGameClockLabel = isReplayOffsetMode ? "Replay" : Self.kickoffWaitClockDisplay
+            }
+            hasSyncedStreamLag = streamDelaySeconds != 0
+                || UserDefaults.standard.bool(forKey: SportsAPIStorageKey.hasSyncedStreamLag)
+            appendActivity("Non-live test mode off")
+        }
+    }
+
+    /// Clears the per-break latch so the next commercial can trigger one skip cycle.
+    private func resetBreakSkipLatch() {
+        hasTriggeredThisBreak = false
+        isBreakActive = false
+        lastBreakPlayID = nil
+        consecutiveBreakPolls = 0
+        pendingAutoGoLive = false
+        isCommercialBreakLoopActive = false
+        commercialBreakHighlightIndex = 0
+        scheduledReturnToLiveTask?.cancel()
+        scheduledReturnToLiveTask = nil
+        clearBreakPlaybackState()
+    }
+
+    /// Synthetic clock for off-air testing — same as `startLocalMatchClock` if not already ticking.
+    private func activateNonLiveTestSession() {
+        guard isNonLiveTestModeEnabled, hasMonitoredGame else { return }
+
+        offsetCalibrationHoldUntil = nil
+        hasSyncedStreamLag = true
+        UserDefaults.standard.set(true, forKey: SportsAPIStorageKey.hasSyncedStreamLag)
+
+        if matchElapsedBaseCapturedAt == nil {
+            startLocalMatchClock(atSeconds: 0)
+        } else {
+            isMatchPhysicallyActive = true
+            startMatchClockUITimer()
+        }
+
+        lastStatusSummary = "Test mode — set clock to any time with +/−"
+    }
+
+    /// Manual rewind test from Settings — does not require ESPN break detection.
+    func triggerTestRewind(seconds: Int = 120) {
+        guard isNonLiveTestModeEnabled else { return }
+        guard let tvController else {
+            lastStatusSummary = "Connect TV first"
+            return
+        }
+        guard tvController.isConnected else {
+            lastStatusSummary = "Connect TV first"
+            return
+        }
+        let snapped = tvController.snappedRewindSeconds(targetSeconds: seconds)
+        lastPlannedRewindSeconds = snapped
+        lastStatusSummary = "Test rewind \(snapped)s…"
+        _ = tvController.triggerRewindMacro(targetSeconds: snapped)
     }
 
     // MARK: - Match Elapsed Clock (synced to ESPN game time, ticks locally)
 
     /// Anchor for 1 Hz UI ticks — aligned to when ESPN game time was last seeded.
     var matchClockTickAnchor: Date? {
-        guard isMatchPhysicallyActive else { return nil }
-        return matchElapsedBaseCapturedAt
+        matchElapsedBaseCapturedAt
     }
 
     private static func alignedToWholeSecond(_ date: Date) -> Date {
@@ -573,7 +760,7 @@ final class SportsAPIService: ObservableObject {
 
     /// Seconds elapsed in the match per ESPN — ticks every second during live play.
     func espnElapsedSeconds(at date: Date = Date()) -> Int? {
-        guard isMatchPhysicallyActive, let capturedAt = matchElapsedBaseCapturedAt else { return nil }
+        guard let capturedAt = matchElapsedBaseCapturedAt else { return nil }
         if isMatchClockPaused {
             return max(0, matchElapsedBaseSeconds)
         }
@@ -648,8 +835,6 @@ final class SportsAPIService: ObservableObject {
         )
         matchElapsedBaseCapturedAt = Date(timeIntervalSince1970: capturedTS)
         isMatchClockPaused = false
-
-        guard isTrackedGameLive else { return }
         isMatchPhysicallyActive = true
         liveGameClockLabel = formatElapsedClock(espnElapsedSeconds() ?? matchElapsedBaseSeconds)
         startMatchClockUITimer()
@@ -836,38 +1021,39 @@ final class SportsAPIService: ObservableObject {
         Self.formatStreamDelayOffset(streamDelaySeconds)
     }
 
+    /// Caps bogus wall-clock math (replay / wrong delay) — prevents rewinding to DVR start.
+    private static let maxSanityRewindSeconds = 45 * 60
+
     /// Universal highlight rewind from an ESPN ISO-8601 wallclock + `streamDelaySeconds`.
     func calculatedRewindSeconds(for highlight: SportHighlight, now: Date = Date()) -> Int {
-        SportHighlightEngine.finalRewindSeconds(
+        guard supportsTimestampHighlightRewinds else {
+            return tvController?.snappedSkipSeconds(targetSeconds: maxGenericSkipSeconds) ?? maxGenericSkipSeconds
+        }
+        let raw = SportHighlightEngine.finalRewindSeconds(
             highlightDate: highlight.apiTimestamp,
             streamDelaySeconds: streamDelaySeconds,
             now: now
         )
+        if raw > Self.maxSanityRewindSeconds {
+            print("⚠️ SportsAPIService: rewind \(raw)s capped — sync Match Clock or pick a live game")
+            return tvController?.snappedSkipSeconds(targetSeconds: commercialRewindTargetSeconds)
+                ?? commercialRewindTargetSeconds
+        }
+        return raw
     }
 
     private func applyScoreboardClock(_ clock: ESPNGameClock) {
         applyESPNGameClock(clock, source: "scoreboard", force: true)
     }
 
-    // MARK: - Stream Lag Sync
-
-    /// User matched the +/- clock to their TV — offset is the broadcast delay.
-    func confirmStreamDelay(_ delaySeconds: Int) {
-        let clamped = max(
-            Int(Self.settingsSliderDelayRange.lowerBound),
-            min(delaySeconds, Int(Self.settingsSliderDelayRange.upperBound))
-        )
-        applyStreamDelaySync(Double(clamped), method: "matched TV clock")
-    }
-
     // MARK: - Clock Display (elapsed 00:00 + TV delay offset)
 
     /// ESPN elapsed match clock — zero delay, ticks from kickoff.
     func espnAPIClockDisplay(at date: Date = Date()) -> String {
-        if isReplayOffsetMode {
+        if isReplayOffsetMode, !isNonLiveTestModeEnabled, matchElapsedBaseCapturedAt == nil {
             return "Replay"
         }
-        guard isMatchPhysicallyActive, let elapsed = espnElapsedSeconds(at: date) else {
+        guard let elapsed = espnElapsedSeconds(at: date) else {
             return Self.kickoffWaitClockDisplay
         }
         return formatElapsedClock(elapsed)
@@ -875,10 +1061,10 @@ final class SportsAPIService: ObservableObject {
 
     /// What your TV should show — ESPN elapsed minus `streamDelaySeconds`.
     func calibratedTVTimelineDisplay(at date: Date = Date()) -> String {
-        if isReplayOffsetMode {
+        if isReplayOffsetMode, !isNonLiveTestModeEnabled, matchElapsedBaseCapturedAt == nil {
             return Self.formatStreamDelayOffset(streamDelaySeconds)
         }
-        guard isMatchPhysicallyActive, let tvSeconds = tvElapsedSeconds(at: date) else {
+        guard let tvSeconds = tvElapsedSeconds(at: date) else {
             return Self.kickoffWaitClockDisplay
         }
         return formatElapsedClock(tvSeconds)
@@ -947,23 +1133,7 @@ final class SportsAPIService: ObservableObject {
         )
     }
 
-    private func applyStreamDelaySync(_ delay: Double, method: String) {
-        streamDelaySeconds = delay
-        let label = Self.formatStreamDelayOffset(delay)
-        lastStatusSummary = "Synced — TV offset \(label)"
-        appendActivity("Lag synced via \(method) — \(label)")
-
-        print("📡 SportsAPIService: streamDelaySeconds = \(delay)s (\(method))")
-
-        guard let tvController else { return }
-        Task {
-            await tvController.sendLGTVToastNotification(
-                message: "ZapRemote: Synced — \(Int(delay.rounded()))s behind live"
-            )
-        }
-    }
-
-    /// Persists Hue latency offset and marks calibration active for highlight rewind math.
+    /// Persists TV offset (`user_stream_delay`) for highlight rewind math.
     private func applyTimelineCalibrationOffset() {
         let clamped = min(
             max(Self.settingsSliderDelayRange.lowerBound, streamDelaySeconds.rounded()),
@@ -975,7 +1145,6 @@ final class SportsAPIService: ObservableObject {
         }
 
         UserDefaults.standard.set(streamDelaySeconds, forKey: TimelineCalibrationStorage.userStreamDelayKey)
-        UserDefaults.standard.set(streamDelaySeconds, forKey: SportsAPIStorageKey.streamDelaySeconds)
     }
 
     private func markStreamLagSynced() {
@@ -988,70 +1157,6 @@ final class SportsAPIService: ObservableObject {
     func acknowledgeStreamDelayCalibration() {
         markOffsetCalibrationInProgress()
         markStreamLagSynced()
-    }
-
-    /// Legacy fallback — estimates lag from the latest play wallclock.
-    @discardableResult
-    func syncStreamDelay(apiPlayWallclockString: String) -> Bool {
-        guard let apiDateTime = parseESPNWallclock(apiPlayWallclockString) else {
-            lastStatusSummary = "Invalid ESPN wallclock string"
-            print("❌ SportsAPIService: could not parse wallclock \"\(apiPlayWallclockString)\"")
-            return false
-        }
-
-        let raw = Date().timeIntervalSince(apiDateTime)
-        let minDelay = Double(GameClockSyncEngine.minBroadcastDelaySeconds)
-        let maxDelay = Double(GameClockSyncEngine.maxBroadcastDelaySeconds)
-
-        guard raw >= minDelay else {
-            lastStatusSummary = "Play just hit ESPN — wait until you see it on TV, then tap again"
-            appendActivity("Play sync too early — wait for play on TV")
-            return false
-        }
-        guard raw <= maxDelay else {
-            lastStatusSummary = "Play is too old for sync — use −/+ to set delay manually"
-            appendActivity("Play sync rejected — play too old (\(Int(raw.rounded()))s)")
-            return false
-        }
-
-        applyStreamDelaySync(raw, method: "latest play wallclock")
-        return true
-    }
-
-    /// Precise delay: tap when the latest ESPN play is on your TV right now.
-    @discardableResult
-    func syncStreamDelayFromLatestPlay() async -> Bool {
-        do {
-            let summary = try await fetchGameSummary()
-
-            if Self.isGameFinished(summary) {
-                let message = "Game is over — play sync won't work on replays. Use −/+ to set delay."
-                lastStatusSummary = message
-                tvController?.statusMessage = message
-                appendActivity("Play sync blocked — game finished")
-                return false
-            }
-
-            guard let latestPlay = extractLatestPlay(from: summary),
-                  let wallclock = latestPlay.wallclock else {
-                let message = "Game hasn't started — no plays yet. Set delay with −/+ instead."
-                lastStatusSummary = message
-                tvController?.statusMessage = message
-                appendActivity("Play sync blocked — no ESPN plays yet")
-                return false
-            }
-            let playText = latestPlay.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Latest play"
-            latestESPNPlayLabel = playText
-            guard syncStreamDelay(apiPlayWallclockString: wallclock) else { return false }
-            lastStatusSummary = "Play sync — \(Int(streamDelaySeconds.rounded()))s delay (\"\(playText.prefix(40))…\")"
-            return true
-        } catch {
-            let message = "Sync failed — \(error.localizedDescription)"
-            lastStatusSummary = message
-            tvController?.statusMessage = message
-            print("❌ SportsAPIService sync error: \(error.localizedDescription)")
-            return false
-        }
     }
 
     // MARK: - Live Broadcast Polling
@@ -1102,6 +1207,13 @@ final class SportsAPIService: ObservableObject {
         }
     }
 
+    /// Restarts ESPN polling if iOS suspended timers while the phone was locked.
+    func ensureGamePollingActive() {
+        guard hasMonitoredGame else { return }
+        guard pollingTimer == nil else { return }
+        startGamePolling()
+    }
+
     func stopGamePolling() {
         pollingTimer?.invalidate()
         pollingTimer = nil
@@ -1140,6 +1252,7 @@ final class SportsAPIService: ObservableObject {
 
         do {
             let summary = try await fetchGameSummary()
+            lastSummaryPollAt = Date()
             await evaluateSummary(summary)
         } catch let decodingError as DecodingError {
             monitoringStatus = .error
@@ -1175,12 +1288,15 @@ final class SportsAPIService: ObservableObject {
 
     /// Confirms real kickoff via ESPN play log — blocks ghost pre-game clocks.
     private func refreshKickoffVerification(from summary: ESPNSummaryResponse) async {
+        if isNonLiveTestModeEnabled, hasMonitoredGame {
+            activateNonLiveTestSession()
+            return
+        }
+
         if isReplayOffsetMode || Self.isGameFinished(summary) {
-            isMatchPhysicallyActive = false
-            clearMatchElapsedClock()
-            tickingGameClock = nil
-            liveGameClock = nil
-            liveGameClockLabel = isReplayOffsetMode ? "Replay" : Self.kickoffWaitClockDisplay
+            if matchElapsedBaseCapturedAt == nil {
+                startLocalMatchClock(atSeconds: 0)
+            }
             return
         }
 
@@ -1192,15 +1308,12 @@ final class SportsAPIService: ObservableObject {
         isMatchPhysicallyActive = verified
 
         guard verified else {
-            clearMatchElapsedClock()
-            liveGameClockLabel = Self.kickoffWaitClockDisplay
-            tickingGameClock = nil
-            liveGameClock = nil
-            if hasSyncedStreamLag {
-                hasSyncedStreamLag = false
-                UserDefaults.standard.set(false, forKey: SportsAPIStorageKey.hasSyncedStreamLag)
+            if matchElapsedBaseCapturedAt == nil {
+                startLocalMatchClock(atSeconds: 0)
             }
-            if isTrackedGameLive {
+            if hasSyncedStreamLag {
+                // keep lag sync — user may have calibrated before ESPN confirms kickoff
+            } else if isTrackedGameLive {
                 lastStatusSummary = Self.kickoffWaitBanner
             }
             return
@@ -1238,6 +1351,12 @@ final class SportsAPIService: ObservableObject {
         } else if wasPaused {
             syncMatchClockFromSummary(summary, force: true, paused: false)
         } else {
+            if let clock = parseClock(from: summary) {
+                let espnElapsed = GameClockSyncEngine.elapsedGameSeconds(from: clock, sportPath: sportPath)
+                if let local = espnElapsedSeconds(), abs(espnElapsed - local) > 90 {
+                    syncMatchClockFromSummary(summary, force: true, paused: false)
+                }
+            }
             startMatchClockUITimer()
             if let elapsed = espnElapsedSeconds() {
                 liveGameClockLabel = formatElapsedClock(elapsed)
@@ -1254,6 +1373,11 @@ final class SportsAPIService: ObservableObject {
         let status = summary.header?.competitions?.first?.status
         let latestPlay = extractLatestPlay(from: summary)
         let clockPaused = ESPNBreakClassifier.isCommercialBreak(status: status, latestPlay: latestPlay)
+        let handsFreeBreak = ESPNBreakClassifier.isHandsFreeCommercialBreak(
+            status: status,
+            latestPlay: latestPlay,
+            sportPath: sportPath
+        )
 
         await refreshKickoffVerification(from: summary)
         await reconcileLiveMatchClock(from: summary, paused: clockPaused)
@@ -1264,16 +1388,48 @@ final class SportsAPIService: ObservableObject {
         }
         let statusLabel = status?.type.description ?? status?.type.name ?? latestPlay?.text ?? "Unknown"
 
+        // Don't let ESPN poll churn break state while the highlight reel is running.
+        if isCommercialBreakLoopActive {
+            isBreakActive = true
+            lastStatusSummary = "Highlight reel \(commercialBreakHighlightIndex)/\(max(commercialBreakPlaylist.count, 1))…"
+            return
+        }
+
+        if hasTriggeredThisBreak && (pendingAutoGoLive || tvController?.isExecutingMacro == true || tvController?.isMacroRunning == true) {
+            isBreakActive = true
+            return
+        }
+
         if clockPaused {
             lastBreakPlayID = latestPlay?.id
             isBreakActive = true
-            if isHandsFreeAutomationEnabled {
-                await triggerAutomaticAdSkip(source: "ESPN auto")
+
+            if handsFreeBreak {
+                consecutiveBreakPolls += 1
             } else {
-                lastStatusSummary = "Game stopped on ESPN — tap Ad on my TV"
+                consecutiveBreakPolls = 0
+            }
+
+            let minPolls = sportPath.lowercased().contains("soccer") ? 3 : minBreakPollsBeforeAutoSkip
+
+            if handsFreeBreak,
+               supportsTimestampHighlightRewinds,
+               consecutiveBreakPolls >= minPolls,
+               !hasTriggeredThisBreak {
+                await triggerAutomaticAdSkip(source: "ESPN auto")
+            } else if handsFreeBreak, !hasTriggeredThisBreak {
+                if supportsTimestampHighlightRewinds {
+                    lastStatusSummary = "Break detected — confirming (\(consecutiveBreakPolls)/\(minPolls))…"
+                } else {
+                    lastStatusSummary = "Replay — tap Ad on TV for a test skip"
+                }
+            } else if !handsFreeBreak, !hasTriggeredThisBreak {
+                lastStatusSummary = "Waiting for halftime…"
             }
             return
         }
+
+        consecutiveBreakPolls = 0
 
         if ESPNBreakClassifier.isActivePlay(status: status, latestPlay: latestPlay) {
             let macroInFlight = tvController?.isMacroRunning == true
@@ -1283,33 +1439,30 @@ final class SportsAPIService: ObservableObject {
                 return
             }
 
+            if isCommercialBreakLoopActive || pendingAutoGoLive {
+                appendActivity("Play resumed mid-highlight — jumping to live")
+                await abortHighlightPlaybackAndReturnToLive(reason: "Play resumed on ESPN")
+                return
+            }
+
             if hasTriggeredThisBreak || isBreakActive {
                 let shouldReturnToLive = (tvController?.lastRewindClickCount ?? 0) > 0
-                hasTriggeredThisBreak = false
-                isBreakActive = false
-                lastBreakPlayID = nil
-                lastStatusSummary = pendingAutoGoLive
-                    ? "Play resumed — highlight playing, Go Live scheduled"
-                    : "Active play — \(statusLabel)"
-                if !pendingAutoGoLive {
-                    appendActivity("Play resumed — returning to live")
-                    print("🟢 SportsAPIService: play resumed — debounce reset")
-                }
+                resetBreakSkipLatch()
+                lastStatusSummary = "Active play — \(statusLabel)"
+                appendActivity("Play resumed — returning to live")
+                print("🟢 SportsAPIService: play resumed — break latch cleared")
 
-                if shouldReturnToLive, let tvController, isHandsFreeAutomationEnabled,
-                   !autoReturnToLiveAfterHighlight, !pendingAutoGoLive {
-                    let feedCatchUpSeconds = streamDelaySeconds
-                    Task {
-                        if feedCatchUpSeconds > 0 {
-                            try? await Task.sleep(nanoseconds: UInt64(feedCatchUpSeconds * 1_000_000_000))
-                        }
-                        guard !self.isBreakActive else { return }
-                        await tvController.executeGoLiveMacro()
-                    }
+                if shouldReturnToLive, let tvController {
+                    await returnToLiveAfterBreak(reason: "ESPN play resumed")
                 }
             } else {
                 lastStatusSummary = "In progress — \(statusLabel)"
             }
+            return
+        }
+
+        if hasTriggeredThisBreak {
+            isBreakActive = true
             return
         }
 
@@ -1321,13 +1474,16 @@ final class SportsAPIService: ObservableObject {
 
     /// ESPN timeout / cloud `ad_start` — runs the same macro as the manual button.
     private func triggerAutomaticAdSkip(source: String) async {
-        guard !hasTriggeredThisBreak, !isCommercialBreakLoopActive else { return }
+        guard !hasTriggeredThisBreak, !isCommercialBreakLoopActive, !pendingAutoGoLive else { return }
         guard let tvController else { return }
 
-        guard hasSyncedStreamLag, allowsStreamOffsetCalibration else {
-            lastStatusSummary = allowsStreamOffsetCalibration
-                ? "Set TV delay (+seconds) — then hands-free can skip"
-                : Self.kickoffWaitBanner
+        guard hasSyncedStreamLag else {
+            lastStatusSummary = "Sync Match Clock first — tap ± until TV matches your screen"
+            return
+        }
+
+        guard allowsStreamOffsetCalibration else {
+            lastStatusSummary = Self.kickoffWaitBanner
             return
         }
 
@@ -1338,7 +1494,7 @@ final class SportsAPIService: ObservableObject {
 
         guard !tvController.isExecutingMacro else { return }
 
-        let rewindSeconds = await resolveAdSkipRewindSeconds()
+        let rewindSeconds = await resolveAdSkipRewindSeconds(preferCached: true)
         await executeAdSkipRewind(rewindSeconds: rewindSeconds, source: source)
     }
 
@@ -1350,6 +1506,17 @@ final class SportsAPIService: ObservableObject {
             return
         }
 
+        if isCommercialBreakLoopActive || tvController.isExecutingMacro || tvController.isMacroRunning {
+            lastStatusSummary = "Skip already running — wait for it to finish"
+            tvController.statusMessage = lastStatusSummary
+            return
+        }
+
+        if hasTriggeredThisBreak {
+            lastStatusSummary = "Already skipped this break — wait for play to resume or tap Go Live"
+            return
+        }
+
         guard tvController.isConnected else {
             let message = "Connect your TV first, then try again."
             lastStatusSummary = message
@@ -1358,12 +1525,27 @@ final class SportsAPIService: ObservableObject {
             return
         }
 
+        if supportsTimestampHighlightRewinds, !hasSyncedStreamLag {
+            lastStatusSummary = "Open Match Clock — tap ± until TV matches your screen"
+            tvController.statusMessage = lastStatusSummary
+            return
+        }
+
         let rewindSeconds = await resolveAdSkipRewindSeconds()
         await executeAdSkipRewind(rewindSeconds: rewindSeconds, source: "Ad on TV")
     }
 
     /// Picks ranked ESPN highlight rewind, generic fallback, or a fixed test skip.
-    private func resolveAdSkipRewindSeconds() async -> Int {
+    private func resolveAdSkipRewindSeconds(preferCached: Bool = false) async -> Int {
+        let cacheIsFresh = lastSummaryPollAt.map { Date().timeIntervalSince($0) < 10 } ?? false
+        if (preferCached || cacheIsFresh),
+           hasSyncedStreamLag,
+           lastPlannedRewindSeconds > 0 {
+            let snapped = tvController?.snappedRewindSeconds(targetSeconds: lastPlannedRewindSeconds)
+                ?? lastPlannedRewindSeconds
+            return snapped
+        }
+
         var selectedHighlight: SportHighlight?
         if let summary = try? await fetchGameSummary() {
             isTrackedGameLive = Self.isGameLive(summary)
@@ -1399,9 +1581,10 @@ final class SportsAPIService: ObservableObject {
         }
 
         let usesHighlight = selectedHighlight != nil && hasSyncedStreamLag && lastPlannedRewindSeconds > 0
-        let maxCap = usesHighlight ? maxHighlightSkipSeconds : maxGenericSkipSeconds
-        let capped = min(raw, maxCap)
-        let snapped = tvController?.snappedSkipSeconds(targetSeconds: capped) ?? capped
+        let capped = usesHighlight ? raw : min(raw, maxGenericSkipSeconds)
+        let snapped = usesHighlight
+            ? (tvController?.snappedRewindSeconds(targetSeconds: capped) ?? capped)
+            : (tvController?.snappedSkipSeconds(targetSeconds: capped) ?? capped)
         lastPlannedRewindSeconds = snapped
         return snapped
     }
@@ -1413,48 +1596,61 @@ final class SportsAPIService: ObservableObject {
             print("🛑 SportsAPIService: cloud ad-detect ignored — break already in progress")
             return
         }
-        guard isHandsFreeAutomationEnabled else {
-            lastStatusSummary = "Cloud ad detected — enable hands-free in Settings"
-            return
-        }
-        let rewindSeconds = await resolveAdSkipRewindSeconds()
+        let rewindSeconds = await resolveAdSkipRewindSeconds(preferCached: true)
         let useSeconds = max(rewindSeconds, tvController?.snappedSkipSeconds(targetSeconds: fallbackRewindSeconds) ?? fallbackRewindSeconds)
         await executeAdSkipRewind(rewindSeconds: useSeconds, source: "Cloud ad detect")
     }
 
     /// Cloud detector says game is live again — return after TV feed catches up.
     func resumeFromCloudGameLive() async {
-        if pendingAutoGoLive || isCommercialBreakLoopActive {
-            lastStatusSummary = "Highlight reel playing — Go Live scheduled"
-            appendActivity("Ignored cloud game_live during highlight loop")
+        if isCommercialBreakLoopActive || pendingAutoGoLive {
+            await abortHighlightPlaybackAndReturnToLive(reason: "Cloud game_live")
             return
         }
+
         let shouldReturnToLive = (tvController?.lastRewindClickCount ?? 0) > 0
+            || currentBehindSeconds > 0
         hasTriggeredThisBreak = false
         isBreakActive = false
         lastBreakPlayID = nil
-        lastStatusSummary = "Game live — returning to live edge"
-        appendActivity("Cloud game_live — waiting for TV feed")
 
-        guard shouldReturnToLive, let tvController else { return }
-
-        if streamDelaySeconds > 0 {
-            try? await Task.sleep(nanoseconds: UInt64(streamDelaySeconds * 1_000_000_000))
+        guard shouldReturnToLive else {
+            lastStatusSummary = "Game live — no rewind to undo"
+            return
         }
-        await tvController.executeGoLiveMacro()
+
+        await returnToLiveAfterBreak(reason: "Cloud game_live")
     }
 
     private func executeAdSkipRewind(rewindSeconds: Int, source: String) async {
-        hasTriggeredThisBreak = true
-        isBreakActive = true
-
         guard let tvController else {
             lastStatusSummary = "Ad skip failed — TV not connected"
             return
         }
 
+        if supportsTimestampHighlightRewinds, !hasSyncedStreamLag {
+            lastStatusSummary = "Sync Match Clock first — highlights need TV delay"
+            tvController.statusMessage = lastStatusSummary
+            return
+        }
+
+        if supportsTimestampHighlightRewinds,
+           !commercialBreakPlaylist.isEmpty,
+           let first = commercialBreakPlaylist.first {
+            let planned = calculatedRewindSeconds(for: first)
+            if planned > Self.maxSanityRewindSeconds {
+                lastStatusSummary = "Match Clock looks wrong (\(planned)s rewind) — re-sync TV ±"
+                tvController.statusMessage = lastStatusSummary
+                appendActivity("Skip blocked — Match Clock out of sync")
+                return
+            }
+        }
+
+        hasTriggeredThisBreak = true
+        isBreakActive = true
+
         if tvController.isExecutingMacro || isCommercialBreakLoopActive {
-            let message = "Rewind already running — wait ~10 sec."
+            let message = "Rewind already running — wait a few sec."
             lastStatusSummary = message
             tvController.statusMessage = message
             appendActivity("Ad skip blocked — macro lock active")
@@ -1463,8 +1659,15 @@ final class SportsAPIService: ObservableObject {
             return
         }
 
-        await tvController.fetchActiveAppID()
-        await executeSingleHighlightSkip(rewindSeconds: rewindSeconds, source: source)
+        if tvController.currentAppID.isEmpty, !tvController.preferredStreamingAppID.isEmpty {
+            Task { await tvController.fetchActiveAppID() }
+        }
+
+        if supportsTimestampHighlightRewinds, !commercialBreakPlaylist.isEmpty {
+            await runCommercialBreakHighlightLoop(source: source)
+        } else {
+            await executeSingleHighlightSkip(rewindSeconds: rewindSeconds, source: source)
+        }
     }
 
     private func executeSingleHighlightSkip(rewindSeconds: Int, source: String) async {
@@ -1473,7 +1676,7 @@ final class SportsAPIService: ObservableObject {
         let highlight = lastHighlightTarget.isEmpty ? "generic skip" : lastHighlightTarget
         let rankLabel = selectedHighlightRank > 0 ? "R\(selectedHighlightRank)" : "—"
         let secondsPerClick = tvController.secondsPerSkipClick()
-        let snapped = tvController.snappedSkipSeconds(targetSeconds: rewindSeconds)
+        let snapped = tvController.snappedRewindSeconds(targetSeconds: rewindSeconds)
         let skipClicks = snapped / secondsPerClick
         lastStatusSummary = "\(source) — \(rankLabel) → \(highlight) (\(skipClicks)×\(secondsPerClick)s)"
         appendActivity("\(source) → \(skipClicks) skips on TV")
@@ -1481,15 +1684,18 @@ final class SportsAPIService: ObservableObject {
 
         let started = tvController.triggerRewindMacro(targetSeconds: snapped)
         if started {
-            if autoReturnToLiveAfterHighlight {
-                pendingAutoGoLive = true
-                scheduleReturnToLiveAfterHighlight(savedClickCount: skipClicks)
-            }
-            Task {
-                await tvController.sendLGTVToastNotification(
-                    message: "ZapRemote: \(skipClicks)×\(secondsPerClick)s skip"
-                )
-            }
+            beginBreakPlayback(rewindSeconds: snapped)
+            await tvController.waitForMacroCycleToFinish()
+            await tvController.updateHighlightReelBanner(index: 1, total: 1)
+            let watchRank = max(1, selectedHighlightRank)
+            let placeholder = SportHighlight(
+                id: "single-skip",
+                playDescription: lastHighlightTarget.isEmpty ? "Highlight" : lastHighlightTarget,
+                apiTimestamp: Date(),
+                interestRank: watchRank
+            )
+            await waitHighlightPlayback(for: placeholder)
+            await returnToLiveAfterHighlightReel(tvController: tvController)
         } else {
             isBreakActive = false
             hasTriggeredThisBreak = false
@@ -1498,12 +1704,12 @@ final class SportsAPIService: ObservableObject {
         }
     }
 
-    /// Plays up to three ESPN highlights during a commercial break, then returns to live.
+    /// Cycles ranked plays in chronological order until the break ends.
     private func runCommercialBreakHighlightLoop(source: String) async {
         guard let tvController else { return }
 
         let playlist = commercialBreakPlaylist
-        guard playlist.count >= 2 else {
+        guard !playlist.isEmpty else {
             await executeSingleHighlightSkip(
                 rewindSeconds: lastPlannedRewindSeconds,
                 source: source
@@ -1515,98 +1721,204 @@ final class SportsAPIService: ObservableObject {
         pendingAutoGoLive = autoReturnToLiveAfterHighlight
         scheduledReturnToLiveTask?.cancel()
 
-        lastStatusSummary = "\(source) — \(playlist.count) highlight reel"
-        appendActivity("\(source) → \(playlist.count)× highlight loop")
-        tvController.statusMessage = "Commercial break — \(playlist.count) highlights…"
-
-        Task {
-            await tvController.sendLGTVToastNotification(
-                message: "ZapRemote: \(playlist.count) highlights during break"
-            )
-        }
+        lastStatusSummary = "\(source) — \(playlist.count) plays"
+        appendActivity("\(source) → \(playlist.count)× highlight reel")
+        tvController.statusMessage = "Commercial break — \(playlist.count) plays…"
 
         scheduledReturnToLiveTask = Task { [weak self] in
             guard let self, let tvController = self.tvController else { return }
 
             defer {
                 self.isCommercialBreakLoopActive = false
-                self.commercialBreakHighlightIndex = 0
             }
 
-            for (index, highlight) in playlist.enumerated() {
-                guard !Task.isCancelled, self.isBreakActive else { return }
+            for index in playlist.indices {
+                guard !Task.isCancelled, self.isBreakActive else { break }
 
-                self.commercialBreakHighlightIndex = index + 1
+                let highlight = playlist[index]
+                let displayIndex = index + 1
+                var previousHighlight: SportHighlight? = index > 0 ? playlist[index - 1] : nil
+
+                self.commercialBreakHighlightIndex = displayIndex
                 self.selectedHighlightRank = highlight.interestRank
                 self.lastHighlightTarget = highlight.playDescription
 
+                await tvController.updateHighlightReelBanner(
+                    index: displayIndex,
+                    total: playlist.count
+                )
+
                 if index == 0 {
                     let rewind = self.calculatedRewindSeconds(for: highlight)
-                    let capped = min(rewind, self.maxHighlightSkipSeconds)
-                    self.lastPlannedRewindSeconds = tvController.snappedSkipSeconds(targetSeconds: capped)
+                    self.lastPlannedRewindSeconds = tvController.snappedRewindSeconds(targetSeconds: rewind)
                     guard tvController.triggerRewindMacro(
                         highlightDate: highlight.apiTimestamp,
                         streamDelaySeconds: self.streamDelaySeconds,
-                        maxSeconds: capped
+                        highlightBannerIndex: displayIndex,
+                        highlightBannerTotal: playlist.count
                     ) else {
                         self.finishCommercialBreakLoop(success: false, message: tvController.statusMessage)
                         return
                     }
                     await tvController.waitForMacroCycleToFinish()
-                } else {
-                    let earlier = playlist[index - 1]
-                    let forward = SportHighlightEngine.forwardSecondsBetween(earlier: earlier, later: highlight)
-                    let snapped = tvController.snappedSkipSeconds(targetSeconds: forward)
-                    let ok = await tvController.skipForwardOnScrubBar(targetSeconds: snapped)
+                    self.beginBreakPlayback(rewindSeconds: self.lastPlannedRewindSeconds)
+                } else if let earlier = previousHighlight {
+                    let watchedEarlier = self.highlightLoopWatchDuration(for: earlier)
+                    let forward = SportHighlightEngine.forwardSecondsToNextHighlight(
+                        earlier: earlier,
+                        later: highlight,
+                        watchedSeconds: watchedEarlier
+                    )
+                    let snapped = tvController.snappedRewindSeconds(targetSeconds: forward)
+                    let ok = await tvController.skipForwardOnScrubBar(
+                        targetSeconds: snapped,
+                        unlimitedClicks: true
+                    )
                     guard ok else {
                         self.finishCommercialBreakLoop(success: false, message: "Forward skip failed")
                         return
                     }
+                    self.updateBehindAfterForward(seconds: snapped)
                     await tvController.waitForMacroCycleToFinish()
                 }
 
                 let label = highlight.playDescription.prefix(36)
-                self.lastStatusSummary = "Highlight \(index + 1)/\(playlist.count) — \(label)"
+                self.lastStatusSummary = "Highlight \(displayIndex)/\(playlist.count) — \(label)"
                 self.appendActivity("Watching — \(label)")
 
-                let watchSeconds = self.highlightWatchDuration(for: highlight.interestRank)
-                tvController.statusMessage = "Highlight \(index + 1)/\(playlist.count) ~\(Int(watchSeconds))s"
-                try? await Task.sleep(nanoseconds: UInt64(watchSeconds * 1_000_000_000))
-                guard !Task.isCancelled, self.isBreakActive else { return }
+                await self.waitHighlightPlayback(for: highlight)
+
+                guard !Task.isCancelled, self.isBreakActive else { break }
             }
 
             guard !Task.isCancelled else { return }
 
-            if self.pendingAutoGoLive {
-                guard tvController.lastRewindClickCount > 0 else {
-                    self.finishCommercialBreakLoop(success: false, message: "Go Live skipped — no rewind ledger")
-                    return
-                }
-                self.lastStatusSummary = "Returning to live after \(playlist.count) highlights"
-                self.appendActivity("Auto Go Live — highlight reel ended")
-                await tvController.executeGoLiveMacro()
-                self.finishCommercialBreakLoop(success: true, message: "Back to live after \(playlist.count) highlights")
-            } else {
-                self.finishCommercialBreakLoop(success: true, message: "Watched \(playlist.count) highlights — tap Go Live")
-            }
+            self.commercialBreakHighlightIndex = playlist.count
+            self.lastStatusSummary = "Reel complete — returning to live…"
+            self.appendActivity("Reel complete → Go Live")
+            await self.returnToLiveAfterHighlightReel(tvController: tvController)
         }
+    }
+
+    private func returnToLiveAfterHighlightReel(tvController: TVController) async {
+        let clicks = calculatedGoLiveForwardClicks()
+        guard clicks > 0 else {
+            finishCommercialBreakLoop(success: false, message: "Go Live skipped — nothing to catch up")
+            return
+        }
+
+        clearBreakPlaybackState()
+        await tvController.executeGoLiveMacro(forwardClicks: clicks)
+        await tvController.endHighlightReelBanner()
+        finishCommercialBreakLoop(success: true, message: "Back to live")
+    }
+
+    private func beginBreakPlayback(rewindSeconds: Int) {
+        activeBreakStartedAt = activeBreakStartedAt ?? Date()
+        activeBreakInitialRewindSeconds = max(activeBreakInitialRewindSeconds, rewindSeconds)
+        currentBehindSeconds = rewindSeconds
+        behindPositionUpdatedAt = Date()
+    }
+
+    private func updateBehindAfterForward(seconds: Int) {
+        currentBehindSeconds = max(0, currentBehindSeconds - seconds)
+        behindPositionUpdatedAt = Date()
+    }
+
+    /// DVR lag + wall-clock drift since last scrub move — fixes landing ~30s behind live.
+    private func calculatedGoLiveForwardClicks() -> Int {
+        guard let tvController else { return 0 }
+        let secondsPerClick = tvController.secondsPerSkipClick()
+        let wallDrift = Int(Date().timeIntervalSince(behindPositionUpdatedAt ?? Date()))
+        let totalBehind = max(currentBehindSeconds, activeBreakInitialRewindSeconds) + wallDrift
+        let timeBased = (totalBehind + secondsPerClick - 1) / secondsPerClick
+        let ledger = tvController.lastRewindClickCount
+        return max(ledger, timeBased) + 2
+    }
+
+    private func clearBreakPlaybackState() {
+        activeBreakStartedAt = nil
+        activeBreakInitialRewindSeconds = 0
+        currentBehindSeconds = 0
+        behindPositionUpdatedAt = nil
+    }
+
+    private func abortHighlightPlaybackAndReturnToLive(reason: String) async {
+        scheduledReturnToLiveTask?.cancel()
+        scheduledReturnToLiveTask = nil
+
+        guard let tvController else {
+            clearBreakPlaybackState()
+            pendingAutoGoLive = false
+            isCommercialBreakLoopActive = false
+            commercialBreakHighlightIndex = 0
+            hasTriggeredThisBreak = false
+            isBreakActive = false
+            lastBreakPlayID = nil
+            return
+        }
+
+        await tvController.endHighlightReelBanner()
+
+        while tvController.isMacroRunning || tvController.isExecutingMacro {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+
+        let clicks = calculatedGoLiveForwardClicks()
+        pendingAutoGoLive = false
+        isCommercialBreakLoopActive = false
+        commercialBreakHighlightIndex = 0
+        hasTriggeredThisBreak = false
+        isBreakActive = false
+        lastBreakPlayID = nil
+
+        guard clicks > 0 else {
+            clearBreakPlaybackState()
+            lastStatusSummary = "\(reason) — nothing to catch up"
+            return
+        }
+
+        lastStatusSummary = "\(reason) — returning to live (\(clicks)× forward)"
+        appendActivity("\(reason) → Go Live")
+        clearBreakPlaybackState()
+        await tvController.executeGoLiveMacro(forwardClicks: clicks)
+    }
+
+    private func returnToLiveAfterBreak(reason: String) async {
+        guard let tvController else { return }
+
+        while tvController.isMacroRunning || tvController.isExecutingMacro {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+
+        let clicks = calculatedGoLiveForwardClicks()
+        guard clicks > 0 else {
+            clearBreakPlaybackState()
+            return
+        }
+
+        lastStatusSummary = "\(reason) — returning to live (\(clicks)× forward)"
+        appendActivity("\(reason) → Go Live")
+        clearBreakPlaybackState()
+        await tvController.executeGoLiveMacro(forwardClicks: clicks)
     }
 
     private func finishCommercialBreakLoop(success: Bool, message: String) {
         pendingAutoGoLive = false
-        hasTriggeredThisBreak = false
-        isBreakActive = false
+        // Keep hasTriggeredThisBreak latched until ESPN play resumes — stops re-trigger during same break.
         isCommercialBreakLoopActive = false
         commercialBreakHighlightIndex = 0
-        lastBreakPlayID = nil
+        clearBreakPlaybackState()
         lastStatusSummary = message
-        if !success {
+        if !success, let tvController {
+            Task { await tvController.endHighlightReelBanner() }
             appendActivity("Highlight loop stopped — \(message)")
+            resetBreakSkipLatch()
         }
     }
 
     /// Waits for the rewind macro to finish, lets the highlight play, then Go Live.
-    private func scheduleReturnToLiveAfterHighlight(savedClickCount: Int) {
+    private func scheduleReturnToLiveAfterHighlight() {
         scheduledReturnToLiveTask?.cancel()
 
         let watchSeconds = highlightWatchDuration(for: selectedHighlightRank)
@@ -1628,32 +1940,39 @@ final class SportsAPIService: ObservableObject {
             try? await Task.sleep(nanoseconds: UInt64(watchSeconds * 1_000_000_000))
             guard !Task.isCancelled, pendingAutoGoLive else { return }
 
-            if tvController.lastRewindClickCount == 0, savedClickCount > 0 {
-                tvController.restoreRewindClickCount(savedClickCount)
-            }
-            guard tvController.lastRewindClickCount > 0 else {
-                lastStatusSummary = "Go Live skipped — no rewind clicks to undo"
-                pendingAutoGoLive = false
+            if !isBreakActive {
+                await abortHighlightPlaybackAndReturnToLive(reason: "Commercial ended during highlight")
                 return
             }
 
-            lastStatusSummary = "Returning to live after highlight"
-            appendActivity("Auto Go Live — highlight window ended")
-            await tvController.executeGoLiveMacro()
+            await returnToLiveAfterBreak(reason: "Highlight window ended")
 
             pendingAutoGoLive = false
-            hasTriggeredThisBreak = false
-            isBreakActive = false
-            lastBreakPlayID = nil
         }
     }
 
     private func highlightWatchDuration(for rank: Int) -> TimeInterval {
         switch rank {
-        case 3: baseHighlightWatchSeconds + 15
-        case 2: baseHighlightWatchSeconds + 5
-        default: baseHighlightWatchSeconds
+        case 3: baseHighlightWatchSeconds + 25
+        case 2: baseHighlightWatchSeconds + 12
+        default: baseHighlightWatchSeconds + 5
         }
+    }
+
+    /// Shorter watch windows during multi-highlight loops so we advance before filler airs.
+    private func highlightLoopWatchDuration(for highlight: SportHighlight) -> TimeInterval {
+        let override = UserDefaults.standard.double(forKey: SportsAPIStorageKey.highlightWatchSeconds)
+        if override > 0 {
+            return override
+        }
+        return SportHighlightEngine.reelWatchSeconds(for: highlight)
+    }
+
+    /// Waits while the on-TV reel banner stays up (banner managed by caller).
+    private func waitHighlightPlayback(for highlight: SportHighlight) async {
+        let watchSeconds = highlightLoopWatchDuration(for: highlight)
+        tvController?.statusMessage = "Watching — \(Int(watchSeconds))s"
+        try? await Task.sleep(nanoseconds: UInt64(watchSeconds * 1_000_000_000))
     }
 
     private static func isGameLive(_ summary: ESPNSummaryResponse) -> Bool {
@@ -1675,6 +1994,7 @@ final class SportsAPIService: ObservableObject {
         pendingAutoGoLive = false
         isCommercialBreakLoopActive = false
         commercialBreakHighlightIndex = 0
+        clearBreakPlaybackState()
     }
 
     // MARK: - Ranked Highlight Loop Engine
@@ -1715,10 +2035,24 @@ final class SportsAPIService: ObservableObject {
             return $0.apiTimestamp > $1.apiTimestamp
         }
 
-        commercialBreakPlaylist = SportHighlightEngine.commercialBreakPlaylist(
-            from: highlights,
-            streamDelaySeconds: streamDelaySeconds
-        )
+        commercialBreakPlaylist = supportsTimestampHighlightRewinds
+            ? SportHighlightEngine.commercialBreakPlaylist(
+                from: highlights,
+                streamDelaySeconds: streamDelaySeconds
+            )
+            : []
+
+        guard supportsTimestampHighlightRewinds else {
+            if let best = highlights.max(by: { lhs, rhs in
+                if lhs.interestRank != rhs.interestRank { return lhs.interestRank < rhs.interestRank }
+                return lhs.apiTimestamp < rhs.apiTimestamp
+            }) {
+                lastHighlightTarget = best.playDescription
+                selectedHighlightRank = best.interestRank
+            }
+            lastPlannedRewindSeconds = maxGenericSkipSeconds
+            return nil
+        }
 
         guard let best = SportHighlightEngine.bestHighlightForCommercialSkip(
             from: highlights,
@@ -1731,11 +2065,7 @@ final class SportsAPIService: ObservableObject {
 
         lastHighlightTarget = best.playDescription
         selectedHighlightRank = best.interestRank
-        let calculated = SportHighlightEngine.finalRewindSeconds(
-            highlightDate: best.apiTimestamp,
-            streamDelaySeconds: streamDelaySeconds
-        )
-        lastPlannedRewindSeconds = min(calculated, maxHighlightSkipSeconds)
+        lastPlannedRewindSeconds = calculatedRewindSeconds(for: best)
 
         return best
     }
@@ -1829,12 +2159,13 @@ final class SportsAPIService: ObservableObject {
         lastStatusSummary = "Simulated play resumed — debounce reset"
     }
 
-    /// User tapped Go Live — clear break state so the button isn't blocked.
+    /// User tapped Go Live — clear break state and dismiss the on-TV highlight chip.
     func clearBreakForManualGoLive() {
         cancelScheduledReturnToLive()
-        hasTriggeredThisBreak = false
-        isBreakActive = false
-        lastBreakPlayID = nil
+        resetBreakSkipLatch()
+        if let tvController {
+            Task { await tvController.endHighlightReelBanner() }
+        }
     }
 
     var hasMonitoredGame: Bool {
@@ -1911,4 +2242,8 @@ enum SportsAPIStorageKey {
     static let hasSyncedStreamLag = "zapremote.sports.hasSyncedStreamLag"
     static let handsFreeAutomation = "zapremote.sports.handsFreeAutomation"
     static let autoReturnToLiveAfterHighlight = "zapremote.sports.autoReturnToLiveAfterHighlight"
+    /// 0 = auto (rank-based). Set in Settings for testing multi-highlight timing.
+    static let highlightWatchSeconds = "zapremote.sports.highlightWatchSeconds"
+    /// Off-air testing — synthetic clock, skip kickoff / lag gates.
+    static let nonLiveTestMode = "zapremote.sports.nonLiveTestMode"
 }

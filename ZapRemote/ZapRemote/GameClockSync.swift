@@ -78,19 +78,19 @@ struct ESPNGameClock: Equatable, Sendable {
 /// Sport-agnostic sync math — wall-clock timestamps only, never display-string arithmetic.
 enum TimelineOffsetEngine {
 
-    /// Lead buffer before the highlight moment on the DVR timeline.
-    static let rewindLeadSeconds: Double = 15.0
+    /// Lead buffer before the ESPN log point — matches `SportHighlightEngine.prePlayPaddingSeconds`.
+    static let rewindLeadSeconds: Double = SportHighlightEngine.prePlayPaddingSeconds
 
-    /// Rewind depth from a highlight's ESPN ISO-8601 wallclock.
-    /// `secondsElapsed + lead + streamDelay` — works for soccer (count-up) and NFL (count-down).
+    /// Rewind depth from a highlight's ESPN ISO-8601 wallclock when the TV is at the live edge.
+    /// `ageOnUserTV + lead` — subtract stream lag (TV behind ESPN), never add it twice.
     static func rewindSeconds(
         highlightDate: Date,
         streamDelaySeconds: Double,
         now: Date = Date(),
         leadSeconds: Double = rewindLeadSeconds
     ) -> Int {
-        let secondsElapsed = now.timeIntervalSince(highlightDate)
-        let finalCalculatedRewind = secondsElapsed + leadSeconds + streamDelaySeconds
+        let ageOnUserTV = now.timeIntervalSince(highlightDate) - streamDelaySeconds
+        let finalCalculatedRewind = ageOnUserTV + leadSeconds
         return max(1, Int(finalCalculatedRewind.rounded()))
     }
 
@@ -173,6 +173,20 @@ enum GameClockSyncEngine {
         if path.contains("basketball") { return 12 * 60 }
         if path.contains("hockey") { return 20 * 60 }
         return 15 * 60
+    }
+
+    /// ESPN 2H soccer clocks often use match minutes (`75'`) or elapsed seconds (`4500`).
+    /// Convert to in-period seconds so we don't add the first half twice.
+    static func normalizeSoccerInPeriodSeconds(
+        clockSeconds: Int,
+        period: Int,
+        sportPath: String
+    ) -> Int {
+        let path = sportPath.lowercased()
+        guard path.contains("soccer") || path.contains("fifa") else { return clockSeconds }
+        let halfLength = periodLengthSeconds(sportPath: sportPath, period: 1)
+        guard period >= 2, clockSeconds >= halfLength else { return clockSeconds }
+        return clockSeconds - halfLength
     }
 
     static func formatClock(seconds: Int) -> String {
@@ -268,17 +282,28 @@ enum GameClockSyncEngine {
             seconds = nil
         }
 
-        guard let clockSeconds = seconds else { return nil }
+        guard let parsedSeconds = seconds else { return nil }
 
         if resolvedPeriod <= 0 {
             let path = sportPath.lowercased()
             if path.contains("soccer") || path.contains("fifa") {
-                resolvedPeriod = clockSeconds > 45 * 60 ? 2 : 1
+                resolvedPeriod = parsedSeconds > 45 * 60 ? 2 : 1
             } else if path.contains("football") || path.contains("basketball") || path.contains("hockey") {
                 resolvedPeriod = 1
             }
         }
         guard resolvedPeriod > 0 else { return nil }
+
+        let clockSeconds: Int
+        if mode == .countUp {
+            clockSeconds = normalizeSoccerInPeriodSeconds(
+                clockSeconds: parsedSeconds,
+                period: resolvedPeriod,
+                sportPath: sportPath
+            )
+        } else {
+            clockSeconds = min(parsedSeconds, maxPeriod)
+        }
 
         let label = periodShortName(resolvedPeriod, sportPath: sportPath)
         let display: String

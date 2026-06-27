@@ -42,10 +42,9 @@ final class AdEventService: ObservableObject {
     @Published private(set) var lastProcessedAt: Date?
     @Published private(set) var isAdBreakActive = false
 
-    @Published var streamDelayOffsetSeconds: Int {
-        didSet {
-            UserDefaults.standard.set(streamDelayOffsetSeconds, forKey: AdEventStorageKey.streamDelayOffset)
-        }
+    /// Reads TV offset from SportsAPIService — single source of truth.
+    private var streamDelayOffsetSeconds: Int {
+        Int(sportsAPIService?.streamDelaySeconds.rounded() ?? 0)
     }
 
     @Published var subscribedGameID: String {
@@ -95,9 +94,6 @@ final class AdEventService: ObservableObject {
         configuration.waitsForConnectivity = true
         webSocketSession = URLSession(configuration: configuration)
 
-        streamDelayOffsetSeconds = UserDefaults.standard.integer(
-            forKey: AdEventStorageKey.streamDelayOffset
-        )
         subscribedGameID = UserDefaults.standard.string(
             forKey: AdEventStorageKey.subscribedGameID
         ) ?? ""
@@ -149,6 +145,13 @@ final class AdEventService: ObservableObject {
         shouldMaintainConnection = true
         reconnectTask?.cancel()
         connect(to: url)
+    }
+
+    /// Re-opens the cloud socket if it dropped while we should still be listening.
+    func ensureConnectionHealth() {
+        guard shouldMaintainConnection else { return }
+        guard bridgeStatus != .connected, bridgeStatus != .connecting else { return }
+        startListening()
     }
 
     /// Stops listening and tears down the cloud socket.
@@ -251,14 +254,7 @@ final class AdEventService: ObservableObject {
         }
 
         tvController.statusMessage = "Commercial detected — rewinding \(effectiveRewind)s…"
-        let started = tvController.triggerRewindMacro(targetSeconds: effectiveRewind)
-        if started {
-            Task {
-                await tvController.sendLGTVToastNotification(
-                    message: "ZapRemote: Rewinding \(effectiveRewind)s of highlights"
-                )
-            }
-        }
+        _ = tvController.triggerRewindMacro(targetSeconds: effectiveRewind)
     }
 
     private func handleGameLive(_ event: AdCloudEvent) async {
@@ -292,10 +288,17 @@ final class AdEventService: ObservableObject {
         let socket = webSocketSession.webSocketTask(with: url)
         webSocketTask = socket
         socket.resume()
+        sendDetectorConfiguration(on: socket)
 
         receiveLoopTask = Task { [weak self] in
             await self?.receiveLoop(on: socket, url: url)
         }
+    }
+
+    /// Pushes the monitored game + sport path so the Mac detector polls the right ESPN feed.
+    func syncDetectorConfiguration() {
+        guard let socket = webSocketTask else { return }
+        sendDetectorConfiguration(on: socket)
     }
 
     private func receiveLoop(on socket: URLSessionWebSocketTask, url: URL) async {
@@ -351,6 +354,29 @@ final class AdEventService: ObservableObject {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let event = json["event"] as? String else { return false }
         return event == "detector_hello"
+    }
+
+    private func sendDetectorConfiguration(on socket: URLSessionWebSocketTask) {
+        let gameID = subscribedGameID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sportPath = sportsAPIService?.monitoredSportPath
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !gameID.isEmpty, !sportPath.isEmpty else { return }
+
+        let payload: [String: String] = [
+            "event": "client_config",
+            "game_id": gameID,
+            "sport_path": sportPath,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let text = String(data: data, encoding: .utf8) else { return }
+
+        socket.send(.string(text)) { error in
+            if let error {
+                print("⚠️ AdEventService: failed to send detector config — \(error.localizedDescription)")
+            } else {
+                print("📡 AdEventService: sent detector config \(sportPath) game \(gameID)")
+            }
+        }
     }
 
     private static func isLoopbackWebSocketURL(_ urlString: String) -> Bool {

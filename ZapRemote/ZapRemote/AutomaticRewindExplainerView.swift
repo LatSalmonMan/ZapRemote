@@ -38,9 +38,9 @@ struct AutomaticRewindExplainerView: View {
                 ExplainerStepCard(
                     theme: theme,
                     step: 2,
-                    title: "Hands-free (default ON)",
+                    title: "Breaks handled automatically",
                     systemImage: "bolt.fill",
-                    detail: "With Hands-free ad skip enabled in Settings, ESPN game stoppages trigger the same skip macro automatically. You can still tap Ad on my TV anytime."
+                    detail: "Halftime and TV timeouts trigger the highlight reel on your LG — no setting to flip. Tap Ad on my TV anytime you want to force it."
                 )
 
                 ExplainerStepCard(
@@ -56,7 +56,7 @@ struct AutomaticRewindExplainerView: View {
                     step: 4,
                     title: "Watch on the big screen",
                     systemImage: "gobackward",
-                    detail: "Your LG TV skips in 15-second steps on YouTube TV (LEFT + OK). When ESPN shows play resumed, ZapRemote taps Go Live automatically."
+                    detail: "Long rewinds: the bot clicks fast to hit YouTube TV's 20s skip tier, then slows for a precise 10s landing. Short skips stay at 10s only."
                 )
 
                 ExplainerStepCard(
@@ -68,7 +68,7 @@ struct AutomaticRewindExplainerView: View {
                 )
 
                 Text(
-                    "ESPN tells us which highlight to target. Hands-free mode fires on game stoppages; cloud detector adds real ad detection when configured."
+                    "ESPN picks the plays. When the reel ends, you're back on live TV."
                 )
                 .font(.footnote)
                 .foregroundStyle(.white.opacity(0.45))

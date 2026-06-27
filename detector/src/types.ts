@@ -13,10 +13,17 @@ export interface AdCloudEvent {
 export interface DetectorConfig {
   port: number;
   gameId: string;
+  espnSportPath: string;
   channel: string;
   hlsUrl: string | null;
   espnPollMs: number;
   hlsPollMs: number;
   suggestedRewindSeconds: number;
   enableEspnStoppageFallback: boolean;
+}
+
+export interface ClientConfigMessage {
+  event: "client_config";
+  game_id: string;
+  sport_path: string;
 }

@@ -60,22 +60,68 @@ const ACTIVE_KEYWORDS = [
  * ESPN game feed — emits game_live when play resumes.
  * Optional fallback ad_start on game stoppage (lower confidence than SCTE-35).
  */
+const ESPN_FETCH_TIMEOUT_MS = 15_000;
+const ESPN_USER_AGENT = "ZapRemote-AdDetector/1.0";
+
+function formatFetchError(error: unknown): string {
+  const err = error as Error & { cause?: Error & { code?: string } };
+  const parts = [err.message || String(error)];
+  const code = err.cause?.code;
+  if (code) parts.push(`code=${code}`);
+  const causeMessage = err.cause?.message;
+  if (causeMessage && causeMessage !== err.message) parts.push(causeMessage);
+  return parts.join(" — ");
+}
+
 export class EspnMonitor {
   private timer: NodeJS.Timeout | null = null;
   private inBreak = false;
   private hasFiredBreak = false;
+  private pollInFlight = false;
+  private consecutiveFailures = 0;
+  private lastErrorLogAt = 0;
+  private gameId: string;
+  private sportPath: string;
 
   constructor(
-    private readonly gameId: string,
+    gameId: string,
+    sportPath: string,
     private readonly channel: string,
     private readonly pollMs: number,
     private readonly onSignal: EspnSignalHandler,
     private readonly enableStoppageFallback: boolean,
     private readonly suggestedRewindSeconds: number
-  ) {}
+  ) {
+    this.gameId = gameId.trim();
+    this.sportPath = sportPath.trim();
+  }
+
+  configure(gameId: string, sportPath: string): void {
+    const nextGameId = gameId.trim();
+    const nextSportPath = sportPath.trim();
+    if (!nextGameId || !nextSportPath) return;
+    if (nextGameId === this.gameId && nextSportPath === this.sportPath && this.timer) return;
+
+    this.gameId = nextGameId;
+    this.sportPath = nextSportPath;
+    this.inBreak = false;
+    this.hasFiredBreak = false;
+    this.consecutiveFailures = 0;
+    console.log(`🏈 ESPN monitor reconfigured → ${nextSportPath} game ${nextGameId}`);
+    this.ensurePolling();
+  }
 
   start(): void {
-    console.log(`🏈 ESPN monitor → game ${this.gameId}`);
+    if (!this.gameId || !this.sportPath) {
+      console.warn("⚠️ ESPN monitor waiting for game config (set ESPN_GAME_ID + ESPN_SPORT_PATH or connect iPhone app)");
+      return;
+    }
+    console.log(`🏈 ESPN monitor → ${this.sportPath} game ${this.gameId}`);
+    this.ensurePolling();
+  }
+
+  private ensurePolling(): void {
+    if (this.timer) return;
     void this.poll();
     this.timer = setInterval(() => void this.poll(), this.pollMs);
   }
@@ -85,16 +131,56 @@ export class EspnMonitor {
     this.timer = null;
   }
 
+  private summaryUrl(): string {
+    return `https://site.api.espn.com/apis/site/v2/sports/${this.sportPath}/summary?event=${this.gameId}`;
+  }
+
+  private async fetchSummary(): Promise<Response> {
+    return fetch(this.summaryUrl(), {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": ESPN_USER_AGENT,
+      },
+      signal: AbortSignal.timeout(ESPN_FETCH_TIMEOUT_MS),
+    });
+  }
+
+  private logPollError(error: unknown): void {
+    this.consecutiveFailures += 1;
+    const now = Date.now();
+    const shouldLog =
+      this.consecutiveFailures === 1 ||
+      now - this.lastErrorLogAt >= 30_000;
+
+    if (!shouldLog) return;
+
+    this.lastErrorLogAt = now;
+    const attempts = this.consecutiveFailures;
+    const suffix = attempts > 1 ? ` (${attempts} failed polls)` : "";
+    console.warn(
+      `⚠️ ESPN poll error${suffix}: ${formatFetchError(error)}\n` +
+        `   URL: ${this.summaryUrl()}\n` +
+        `   Check internet/VPN/DNS. Try: curl -I "${this.summaryUrl()}"`
+    );
+  }
+
   private async poll(): Promise<void> {
+    if (!this.gameId || !this.sportPath) return;
+    if (this.pollInFlight) return;
+
+    this.pollInFlight = true;
     try {
-      const url = `https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary?event=${this.gameId}`;
-      const response = await fetch(url);
+      const response = await this.fetchSummary();
       if (!response.ok) {
-        console.warn(`⚠️ ESPN HTTP ${response.status}`);
+        this.logPollError(new Error(`HTTP ${response.status}`));
         return;
       }
 
       const summary = (await response.json()) as EspnSummary;
+      if (this.consecutiveFailures > 0) {
+        console.log(`✅ ESPN poll recovered after ${this.consecutiveFailures} failure(s)`);
+        this.consecutiveFailures = 0;
+      }
       const status = summary.header?.competitions?.[0]?.status;
       const latestPlay = this.latestPlay(summary);
       const onBreak = this.isBreak(status, latestPlay);
@@ -130,7 +216,9 @@ export class EspnMonitor {
         });
       }
     } catch (error) {
-      console.warn(`⚠️ ESPN poll error: ${(error as Error).message}`);
+      this.logPollError(error);
+    } finally {
+      this.pollInFlight = false;
     }
   }
 

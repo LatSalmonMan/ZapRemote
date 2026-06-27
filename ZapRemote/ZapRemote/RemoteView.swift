@@ -27,7 +27,7 @@ private enum HomeSessionState: Equatable {
         case .needsGame: "Choose tonight's game"
         case .waitingForKickoff: "Waiting for kickoff"
         case .needsLagSync: "Set TV delay"
-        case .watchingLive: "Hands-free armed"
+        case .watchingLive: "You're set"
         case .commercialBreak: "Skipping to highlights"
         case .attention(let message): message
         }
@@ -46,9 +46,9 @@ private enum HomeSessionState: Equatable {
         case .needsLagSync:
             "Tap + or − until your TV clock matches."
         case .watchingLive:
-            "Tap Ad on my TV when commercials start."
+            "Halftime and breaks → highlights on your TV."
         case .commercialBreak:
-            "Watching highlight — Go Live in ~45s."
+            "Watching highlights — returning to live when done."
         case .attention:
             "Check connection and try again."
         }
@@ -104,8 +104,20 @@ struct RemoteView: View {
         if !sportsAPIService.hasMonitoredGame {
             return .needsGame
         }
-        if sportsAPIService.isReplayOffsetMode, !sportsAPIService.hasSyncedStreamLag {
-            return .needsLagSync
+        if sportsAPIService.isNonLiveTestModeEnabled {
+            if sportsAPIService.isBreakActive {
+                return .commercialBreak
+            }
+            if !sportsAPIService.hasSyncedStreamLag {
+                return .needsLagSync
+            }
+            return .watchingLive
+        }
+        if sportsAPIService.isReplayOffsetMode {
+            if !sportsAPIService.hasSyncedStreamLag {
+                return .needsLagSync
+            }
+            return .watchingLive
         }
         if sportsAPIService.isTrackedGameLive, !sportsAPIService.isMatchPhysicallyActive {
             return .waitingForKickoff
@@ -121,8 +133,6 @@ struct RemoteView: View {
 
     private var heroSubtitleText: String {
         switch sessionState {
-        case .watchingLive where sportsAPIService.isHandsFreeAutomationEnabled:
-            return "Hands-free ON — halftime & TV timeouts auto-skip to ESPN highlights."
         case .needsLagSync where sportsAPIService.isReplayOffsetMode:
             return "Set how many seconds your replay is behind ESPN (+1 min, +10s, etc.)."
         case .needsLagSync:
@@ -136,7 +146,7 @@ struct RemoteView: View {
 
     private var statusFootnote: String? {
         if tvController.isMacroRunning || tvController.isExecutingMacro {
-            return "Skipping on TV… keep \(streamingService.rawValue) in the foreground (~10s lock)."
+            return "Skipping on TV… keep \(streamingService.rawValue) in the foreground."
         }
         if let summary = meaningfulStatusSummary {
             return summary
@@ -204,6 +214,7 @@ struct RemoteView: View {
                         isConnecting: tvController.isConnecting,
                         connectionDetail: tvController.connectionStatusHeadline,
                         cloudLabel: adEventService.bridgeStatus.displayLabel,
+                        showsCloudStatus: adEventService.hasConfiguredDetectorURL,
                         onChooseTV: onChooseTV,
                         onResetTV: onResetTV
                     )
@@ -222,7 +233,7 @@ struct RemoteView: View {
                             espnLiveClockLabel: sportsAPIService.espnLiveClockDisplay(at: now)
                                 ?? sportsAPIService.liveGameClockLabel,
                             syncedGameClockLabel: sportsAPIService.uiGameClockDisplay(at: now),
-                            isReplayMode: sportsAPIService.isReplayOffsetMode,
+                            isReplayMode: !sportsAPIService.usesLiveStyleMatchClock,
                             onChangeGame: { isGameSearchPresented = true }
                         )
                     }
@@ -232,10 +243,8 @@ struct RemoteView: View {
                         isTVConnected: tvController.isConnected,
                         isMacroRunning: tvController.isMacroRunning,
                         showSyncLag: sportsAPIService.hasMonitoredGame,
-                        syncLagTitle: sportsAPIService.isReplayOffsetMode ? "TV Delay" : "Match Clock",
-                        syncLagIcon: sportsAPIService.isReplayOffsetMode ? "timer" : "clock.badge.checkmark",
-                        showChooseGame: sessionState == .needsGame,
-                        onChooseGame: { isGameSearchPresented = true },
+                        syncLagTitle: sportsAPIService.usesLiveStyleMatchClock ? "Match Clock" : "TV Delay",
+                        syncLagIcon: sportsAPIService.usesLiveStyleMatchClock ? "clock.badge.checkmark" : "timer",
                         onSyncLag: {
                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
                             isClockSyncPresented = true
@@ -294,13 +303,12 @@ struct RemoteView: View {
                     ScrollView {
                         TimelineSyncView(
                             apiService: sportsAPIService,
-                            theme: theme,
-                            showsResyncButton: true
+                            theme: theme
                         )
                         .padding(20)
                     }
                 }
-                .navigationTitle(sportsAPIService.isReplayOffsetMode ? "TV Delay" : "Match Clock")
+                .navigationTitle(sportsAPIService.usesLiveStyleMatchClock ? "Match Clock" : "TV Delay")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .confirmationAction) {
@@ -408,6 +416,7 @@ private struct HomeConnectionCard: View {
     var isConnecting: Bool = false
     let connectionDetail: String
     let cloudLabel: String
+    var showsCloudStatus: Bool = false
     let onChooseTV: () -> Void
     var onResetTV: (() -> Void)? = nil
 
@@ -463,7 +472,9 @@ private struct HomeConnectionCard: View {
                     color: isConnected ? theme.accentPrimary : (isConnecting ? .orange : .white.opacity(0.35))
                 )
                 statusChip(label: streamingService.rawValue, color: streamingService.accent.opacity(0.85))
-                statusChip(label: cloudLabel, color: .white.opacity(0.40))
+                if showsCloudStatus {
+                    statusChip(label: cloudLabel, color: .white.opacity(0.40))
+                }
             }
         }
         .padding(14)
@@ -650,8 +661,6 @@ private struct HomeControlDeck: View {
     let showSyncLag: Bool
     let syncLagTitle: String
     let syncLagIcon: String
-    let showChooseGame: Bool
-    let onChooseGame: () -> Void
     let onSyncLag: () -> Void
     let onGoLive: () -> Void
     let onBack: () -> Void
@@ -659,18 +668,6 @@ private struct HomeControlDeck: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            if showChooseGame {
-                HomeControlButton(
-                    title: "Choose Game",
-                    systemImage: "sportscourt.fill",
-                    theme: theme,
-                    isPrimary: true,
-                    isEnabled: true,
-                    isWide: true,
-                    action: onChooseGame
-                )
-            }
-
             if showSyncLag {
                 HomeControlButton(
                     title: syncLagTitle,
@@ -687,7 +684,7 @@ private struct HomeControlDeck: View {
                 title: "Ad on my TV",
                 systemImage: "tv.and.hifispeaker.fill",
                 theme: theme,
-                isPrimary: !showSyncLag && !showChooseGame,
+                isPrimary: !showSyncLag,
                 isEnabled: isTVConnected,
                 isWide: true,
                 action: onAdOnTV

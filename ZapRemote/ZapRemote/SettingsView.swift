@@ -2,7 +2,7 @@
 //  SettingsView.swift
 //  ZapRemote
 //
-//  Account and configuration — premium-only $10/mo model.
+//  Account and configuration — premium-only $5/mo model.
 //
 
 import SwiftUI
@@ -35,7 +35,7 @@ enum StreamingServicePreference: String, CaseIterable, Identifiable {
 
     var macroBehaviorNote: String {
         switch self {
-        case .youtubeTV: "15s skip steps"
+        case .youtubeTV: "10s skip steps (1 click/sec)"
         case .huluLive, .peacock: "10s skip steps"
         case .espnPlus: "Skip timing not mapped yet"
         }
@@ -51,9 +51,11 @@ struct SettingsView: View {
     @AppStorage(SettingsStorageKey.defaultStreamingService)
     private var defaultStreamingServiceRaw = StreamingServicePreference.youtubeTV.rawValue
 
+    @AppStorage(SportsAPIStorageKey.highlightWatchSeconds)
+    private var highlightWatchSeconds: Double = 0
+
     @State private var isCheckoutSheetPresented = false
-    @State private var isGameSearchPresented = false
-    @State private var isCloudExpanded = false
+    @State private var isAdvancedExpanded = false
 
     #if DEBUG
     @State private var isDebugExpanded = false
@@ -68,6 +70,13 @@ struct SettingsView: View {
         nonmutating set { defaultStreamingServiceRaw = newValue.rawValue }
     }
 
+    private var highlightWatchLabel: String {
+        if highlightWatchSeconds <= 0 {
+            return "Auto — goals ~22s, big plays ~18s, other ~14s (TV icon stays for whole reel)"
+        }
+        return "Each highlight stays on TV for \(Int(highlightWatchSeconds))s (icon stays for whole reel)"
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
@@ -75,13 +84,9 @@ struct SettingsView: View {
 
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 18) {
-                        gameNightSection
-                        timelineSyncSection
-                        tvSection
-                        automationSection
-                        cloudSection
                         premiumSection
-                        supportSection
+                        automationSection
+                        advancedSection
                         #if DEBUG
                         debugSection
                         #endif
@@ -96,10 +101,6 @@ struct SettingsView: View {
             .sheet(isPresented: $isCheckoutSheetPresented) {
                 PremiumCheckoutSheet()
             }
-            .sheet(isPresented: $isGameSearchPresented) {
-                GameSearchSheet(sportsAPIService: sportsAPIService)
-                    .preferredColorScheme(.dark)
-            }
             .syncStreamingServicePreference(
                 tvController: tvController,
                 storageRawValue: defaultStreamingServiceRaw
@@ -109,42 +110,156 @@ struct SettingsView: View {
 
     // MARK: - Sections
 
-    private var gameNightSection: some View {
-        SettingsCard(theme: theme, title: "Game Night", icon: "sportscourt") {
-            VStack(spacing: 14) {
+    private var automationSection: some View {
+        SettingsCard(theme: theme, title: "TV", icon: "tv.fill") {
+            VStack(spacing: 12) {
                 streamingPicker
 
-                Button {
-                    isGameSearchPresented = true
-                } label: {
-                    HStack(spacing: 12) {
-                        ZStack {
+                Text("Game, clock, and controls are on Home.")
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.32))
+            }
+        }
+    }
+
+    private var advancedSection: some View {
+        SettingsCard(
+            theme: theme,
+            title: "Advanced",
+            icon: "slider.horizontal.3",
+            isCollapsible: true,
+            isExpanded: $isAdvancedExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Mac ad detector (optional)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.45))
+
+                    TextField("ws://192.168.x.x:8787", text: $adEventService.cloudWebSocketURLString)
+                        .font(.caption.monospaced())
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .padding(12)
+                        .background(
                             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(selectedStreamingService.accent.opacity(0.18))
-                                .frame(width: 40, height: 40)
-                            Image(systemName: "sportscourt.fill")
-                                .foregroundStyle(selectedStreamingService.accent)
-                        }
+                                .fill(Color.white.opacity(0.06))
+                        )
 
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(sportsAPIService.monitoredGameLabel.isEmpty ? "Find tonight's game" : sportsAPIService.monitoredGameLabel)
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(.white.opacity(0.92))
-                                .multilineTextAlignment(.leading)
-                            Text(sportsAPIService.monitoringStatus.displayLabel)
-                                .font(.caption)
-                                .foregroundStyle(.white.opacity(0.42))
-                        }
-
-                        Spacer(minLength: 0)
-
-                        Image(systemName: "chevron.right")
+                    HStack {
+                        Text(adEventService.bridgeStatus.displayLabel)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.white.opacity(0.55))
+                        Spacer()
+                        if adEventService.hasConfiguredDetectorURL {
+                            Button(adEventService.bridgeStatus == .connected ? "Reconnect" : "Connect") {
+                                adEventService.stopListening()
+                                adEventService.startListening()
+                            }
                             .font(.caption.weight(.bold))
-                            .foregroundStyle(.white.opacity(0.28))
+                            .foregroundStyle(theme.accentPrimary)
+                        }
                     }
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+
+                Divider().overlay(Color.white.opacity(0.08))
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Highlight watch time (testing)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.45))
+
+                    HStack(spacing: 10) {
+                        Text("10s")
+                            .font(.caption2)
+                            .foregroundStyle(.white.opacity(0.35))
+                        Slider(value: $highlightWatchSeconds, in: 0...90, step: 5)
+                            .tint(theme.accentPrimary)
+                        Text("90s")
+                            .font(.caption2)
+                            .foregroundStyle(.white.opacity(0.35))
+                    }
+
+                    Text(highlightWatchLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.40))
+                }
+
+                Divider().overlay(Color.white.opacity(0.08))
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle(isOn: Binding(
+                        get: { sportsAPIService.isNonLiveTestModeEnabled },
+                        set: { sportsAPIService.setNonLiveTestModeEnabled($0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Non-live test mode")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.white.opacity(0.88))
+                            Text("Test rewinds and match clock anytime — finished games, replays, or off-air.")
+                                .font(.caption2)
+                                .foregroundStyle(.white.opacity(0.40))
+                        }
+                    }
+                    .tint(theme.accentPrimary)
+
+                    if sportsAPIService.isNonLiveTestModeEnabled {
+                        Text("Pick any game from Find Game. Clock starts at 00:00 — nudge ESPN and TV to any time. Ad on TV and test rewind work without a live match.")
+                            .font(.caption2)
+                            .foregroundStyle(theme.accentSecondary.opacity(0.85))
+
+                        if tvController.isConnected {
+                            Button {
+                                sportsAPIService.triggerTestRewind(seconds: 120)
+                            } label: {
+                                Label("Test 2 min rewind on TV", systemImage: "backward.fill")
+                                    .font(.subheadline.weight(.semibold))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.white.opacity(0.85))
+                        }
+                    }
+                }
+
+                Divider().overlay(Color.white.opacity(0.08))
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("TV troubleshooting")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.45))
+
+                    if tvController.isConnected {
+                        Button {
+                            Task { await tvController.sendTestTVNotification() }
+                        } label: {
+                            Label("Test highlight chip on TV (5s)", systemImage: "bell.badge")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.white.opacity(0.85))
+                    }
+
+                    Button(role: .destructive) {
+                        Task { await tvController.resetTVConnection() }
+                    } label: {
+                        Label("Reset TV connection", systemImage: "arrow.counterclockwise")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Divider().overlay(Color.white.opacity(0.08))
+
+                NavigationLink {
+                    AutomaticRewindExplainerView()
+                } label: {
+                    Label("How automatic rewind works", systemImage: "info.circle")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
             }
         }
     }
@@ -194,133 +309,12 @@ struct SettingsView: View {
         }
     }
 
-    private var timelineSyncSection: some View {
-        SettingsCard(
-            theme: theme,
-            title: sportsAPIService.isReplayOffsetMode ? "TV Delay" : "Match Clock",
-            icon: sportsAPIService.isReplayOffsetMode ? "timer" : "clock.badge.checkmark"
-        ) {
-            TimelineSyncView(
-                apiService: sportsAPIService,
-                theme: theme,
-                showsResyncButton: true
-            )
-        }
-    }
-
-    private var tvSection: some View {
-        SettingsCard(theme: theme, title: "TV", icon: "tv.fill") {
-            VStack(spacing: 14) {
-                HStack(spacing: 12) {
-                    Circle()
-                        .fill(tvController.isConnected ? theme.accentPrimary : Color.white.opacity(0.22))
-                        .frame(width: 10, height: 10)
-
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(tvController.isConnected ? "Connected" : "Not connected")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.white.opacity(0.90))
-                        Text(tvController.connectionStatusHeadline)
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.42))
-                    }
-
-                    Spacer()
-
-                    if tvController.isConnected {
-                        Button("Test alert") {
-                            Task { await tvController.sendTestTVNotification() }
-                        }
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(theme.accentPrimary)
-                    }
-                }
-
-                Button(role: .destructive) {
-                    Task { await tvController.resetTVConnection() }
-                } label: {
-                    Label("Reset TV connection", systemImage: "arrow.counterclockwise")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .buttonStyle(.plain)
-            }
-        }
-    }
-
-    private var automationSection: some View {
-        SettingsCard(theme: theme, title: "Automation", icon: "bolt.fill") {
-            VStack(spacing: 16) {
-                SettingsToggleRow(
-                    title: "Hands-free ad skip",
-                    subtitle: "ESPN stoppage or cloud detector → highlights → Go Live",
-                    isOn: $sportsAPIService.isHandsFreeAutomationEnabled
-                )
-
-                Divider().overlay(Color.white.opacity(0.08))
-
-                SettingsToggleRow(
-                    title: "Auto Go Live",
-                    subtitle: "Return to live ~45s after each highlight",
-                    isOn: $sportsAPIService.autoReturnToLiveAfterHighlight
-                )
-            }
-        }
-    }
-
-    private var cloudSection: some View {
-        SettingsCard(theme: theme, title: "Cloud Detector", icon: "waveform", isCollapsible: true, isExpanded: $isCloudExpanded) {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Optional Mac bridge for broadcast ad cues")
-                    .font(.caption)
-                    .foregroundStyle(.white.opacity(0.40))
-
-                TextField("ws://192.168.x.x:8787", text: $adEventService.cloudWebSocketURLString)
-                    .font(.caption.monospaced())
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .padding(12)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(Color.white.opacity(0.06))
-                    )
-
-                HStack {
-                    Text(adEventService.bridgeStatus.displayLabel)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.55))
-                    Spacer()
-                    if adEventService.hasConfiguredDetectorURL {
-                        Button(adEventService.bridgeStatus == .connected ? "Reconnect" : "Connect") {
-                            adEventService.stopListening()
-                            adEventService.startListening()
-                        }
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(theme.accentPrimary)
-                    }
-                }
-            }
-        }
-    }
-
     private var premiumSection: some View {
         PremiumSubscriptionCard(
             theme: theme,
             onActivate: { isCheckoutSheetPresented = true },
             onManage: openStripeBillingPortal
         )
-    }
-
-    private var supportSection: some View {
-        SettingsCard(theme: theme, title: "Help", icon: "questionmark.circle") {
-            NavigationLink {
-                AutomaticRewindExplainerView()
-            } label: {
-                Label("How automatic rewind works", systemImage: "info.circle")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.85))
-            }
-        }
     }
 
     #if DEBUG
@@ -459,11 +453,11 @@ private struct PremiumSubscriptionCard: View {
                         .foregroundStyle(.white.opacity(0.40))
                         .tracking(0.6)
 
-                    Text("$10 / month")
+                    Text(ZapRemotePricing.perMonthLabel)
                         .font(.title2.weight(.bold))
                         .foregroundStyle(theme.headerGradient)
 
-                    Text("Hands-free commercial rewinds")
+                    Text("Live sports on autopilot")
                         .font(.footnote)
                         .foregroundStyle(.white.opacity(0.48))
                 }

@@ -11,12 +11,14 @@ function envInt(name: string, fallback: number): number {
 }
 
 function loadConfig(): DetectorConfig {
-  const gameId = process.env.ESPN_GAME_ID?.trim() || "401547417";
+  const gameId = process.env.ESPN_GAME_ID?.trim() || "";
+  const espnSportPath = process.env.ESPN_SPORT_PATH?.trim() || "";
   const hlsUrl = process.env.HLS_URL?.trim() || null;
 
   return {
     port: envInt("PORT", 8787),
     gameId,
+    espnSportPath,
     channel: process.env.CHANNEL?.trim() || "ESPN",
     hlsUrl,
     espnPollMs: envInt("ESPN_POLL_MS", 3000),
@@ -52,6 +54,7 @@ function main(): void {
 
   const espn = new EspnMonitor(
     config.gameId,
+    config.espnSportPath,
     config.channel,
     config.espnPollMs,
     (event) => {
@@ -62,12 +65,22 @@ function main(): void {
     config.enableEspnStoppageFallback && !config.hlsUrl,
     config.suggestedRewindSeconds
   );
+
+  hub.setClientConfigHandler((clientConfig) => {
+    espn.configure(clientConfig.game_id, clientConfig.sport_path);
+  });
+
   espn.start();
 
   console.log("");
   console.log("ZapRemote Ad Detector");
   console.log(`  WebSocket   ws://0.0.0.0:${config.port}`);
-  console.log(`  Game ID     ${config.gameId}`);
+  console.log(
+    `  Game ID     ${config.gameId || "(waiting — connect iPhone or set ESPN_GAME_ID)"}`
+  );
+  console.log(
+    `  Sport path  ${config.espnSportPath || "(waiting — connect iPhone or set ESPN_SPORT_PATH, e.g. football/nfl)"}`
+  );
   console.log(`  HLS feed    ${config.hlsUrl ?? "(none — set HLS_URL for real ad cues)"}`);
   console.log(`  ESPN fallback ads: ${config.hlsUrl ? "off (SCTE-35 primary)" : config.enableEspnStoppageFallback}`);
   console.log("");

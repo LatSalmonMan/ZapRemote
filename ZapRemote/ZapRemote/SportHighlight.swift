@@ -58,13 +58,21 @@ struct ESPNPlaySnapshot: Sendable {
 
 enum SportHighlightEngine {
 
-    /// Pre-play buffer — land earlier so the full highlight (not just the tail) is visible.
+    /// Pre-play buffer — land earlier so buildup is visible before the ESPN log point.
     static let prePlayPaddingSeconds: Double = 28.0
-    /// Post-play buffer — end of the targeting window after the play finishes.
-    static let postPlayPaddingSeconds: Double = 15.0
+    /// Default post-play buffer after the ESPN log timestamp (reaction, chaos, VAR aftermath).
+    static let postPlayPaddingSeconds: Double = 22.0
+    /// Legacy fallback only — commercial breaks use the full pre-break play log.
     static let recentHighlightWindowSeconds: TimeInterval = 8 * 60
-    static let maxCommercialBreakHighlights = 3
-    static let minSpacingBetweenHighlightsSeconds: Double = 12
+
+    /// Goals / TDs first, then big plays, then any real action since kickoff.
+    static func preBreakHighlightPool(from highlights: [SportHighlight]) -> [SportHighlight] {
+        let top = highlights.filter { $0.interestRank >= 3 }
+        if !top.isEmpty { return top }
+        let notable = highlights.filter { $0.interestRank >= 2 }
+        if !notable.isEmpty { return notable }
+        return highlights.filter { $0.interestRank >= 1 }
+    }
 
     // MARK: Parsing
 
@@ -81,6 +89,10 @@ enum SportHighlightEngine {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let playDescription = (description?.isEmpty == false) ? description! : "Play"
 
+            if isBroadcastFiller(playDescription: playDescription, play: play) {
+                return nil
+            }
+
             let stableID = play.id ?? "\(timestamp.timeIntervalSince1970)-\(playDescription.prefix(24))"
 
             return SportHighlight(
@@ -94,7 +106,7 @@ enum SportHighlightEngine {
 
     // MARK: Ranking
 
-    /// Touchdown / Interception / Fumble = 3, Sack / Pass 20+ yds = 2, else 1.
+    /// Soccer: goal / penalty / red card = 3. NFL: TD / INT / fumble = 3. Big plays = 2.
     static func interestRank(for play: ESPNPlaySnapshot) -> Int {
         let haystack = [
             play.text,
@@ -104,8 +116,21 @@ enum SportHighlightEngine {
         .compactMap { $0?.lowercased() }
         .joined(separator: " ")
 
-        if containsKeyword(in: haystack, keywords: ["touchdown", "interception", "fumble"]) {
+        if isSoccerGoal(in: haystack) || containsKeyword(
+            in: haystack,
+            keywords: ["touchdown", "interception", "fumble", "penalty goal", "red card"]
+        ) {
             return 3
+        }
+
+        if containsKeyword(
+            in: haystack,
+            keywords: [
+                "yellow card", "saved", "save ", "shot on",
+                "corner kick", "free kick", "header"
+            ]
+        ) {
+            return 2
         }
 
         if haystack.contains("sack") || passingYards(in: haystack) ?? 0 >= 20 {
@@ -139,62 +164,127 @@ enum SportHighlightEngine {
         }
     }
 
-    /// Prefers touchdowns / turnovers / big plays; falls back to any recent play.
+    /// Best play since kickoff — prefer goals; never open with kickoff ceremony.
     static func bestHighlightForCommercialSkip(
         from highlights: [SportHighlight],
         now: Date = Date(),
         streamDelaySeconds: Double = 0
     ) -> SportHighlight? {
-        let notable = highlights.filter { $0.interestRank >= 2 }
-        return bestHighlight(
-            from: notable.isEmpty ? highlights : notable,
-            now: now,
-            streamDelaySeconds: streamDelaySeconds
+        _ = now
+        _ = streamDelaySeconds
+        let playlist = commercialBreakPlaylist(
+            from: highlights,
+            streamDelaySeconds: streamDelaySeconds,
+            now: now
         )
+        guard !playlist.isEmpty else { return nil }
+
+        return playlist.max { lhs, rhs in
+            if lhs.interestRank != rhs.interestRank {
+                return lhs.interestRank < rhs.interestRank
+            }
+            return lhs.apiTimestamp < rhs.apiTimestamp
+        }
     }
 
-    /// Up to three notable plays for a commercial-break binge — oldest first for playback.
+    /// Soccer: goals first (chronological), then rank-2 plays after the first goal — no kickoff openers.
     static func commercialBreakPlaylist(
         from highlights: [SportHighlight],
         streamDelaySeconds: Double,
-        maxItems: Int = maxCommercialBreakHighlights,
         now: Date = Date()
     ) -> [SportHighlight] {
-        let notable = highlights.filter { $0.interestRank >= 2 }
-        let pool = notable.isEmpty ? highlights : notable
-        let recent = pool.filter {
-            $0.ageOnUserTV(now: now, streamDelaySeconds: streamDelaySeconds) <= recentHighlightWindowSeconds
-        }
-        let ranked = (recent.isEmpty ? pool : recent).sorted {
-            if $0.interestRank != $1.interestRank { return $0.interestRank > $1.interestRank }
-            return $0.apiTimestamp > $1.apiTimestamp
-        }
-
+        _ = now
+        _ = streamDelaySeconds
         var seen = Set<String>()
-        var picks: [SportHighlight] = []
-        for highlight in ranked {
-            guard seen.insert(highlight.id).inserted else { continue }
-            picks.append(highlight)
-            if picks.count >= maxItems { break }
+
+        func uniqueChronological(_ list: [SportHighlight]) -> [SportHighlight] {
+            list
+                .filter { !isOpeningCeremony($0) }
+                .sorted {
+                    if $0.apiTimestamp != $1.apiTimestamp { return $0.apiTimestamp < $1.apiTimestamp }
+                    return $0.interestRank > $1.interestRank
+                }
+                .filter { seen.insert($0.id).inserted }
         }
 
-        let chronological = picks.sorted { $0.apiTimestamp < $1.apiTimestamp }
-        guard chronological.count >= 2 else { return chronological }
+        let goals = uniqueChronological(highlights.filter { $0.interestRank >= 3 })
+        if !goals.isEmpty {
+            let anchor = goals[0].apiTimestamp
+            let bigPlays = uniqueChronological(
+                highlights.filter { $0.interestRank == 2 && $0.apiTimestamp >= anchor }
+            )
+            let goalIDs = Set(goals.map(\.id))
+            let merged = goals + bigPlays.filter { !goalIDs.contains($0.id) }
+            return dedupeReplayClusters(merged)
+        }
 
-        var spaced: [SportHighlight] = [chronological[0]]
-        for highlight in chronological.dropFirst() {
-            guard let last = spaced.last else { continue }
-            let gap = highlight.apiTimestamp.timeIntervalSince(last.apiTimestamp)
-            if gap >= minSpacingBetweenHighlightsSeconds {
-                spaced.append(highlight)
+        let notable = uniqueChronological(highlights.filter { $0.interestRank >= 2 })
+        if !notable.isEmpty { return dedupeReplayClusters(notable) }
+        return dedupeReplayClusters(uniqueChronological(highlights.filter { $0.interestRank >= 1 }))
+    }
+
+    /// Drops ESPN duplicate log lines for the same TV moment (replay / VAR confirm right after the live play).
+    private static func dedupeReplayClusters(_ playlist: [SportHighlight]) -> [SportHighlight] {
+        guard !playlist.isEmpty else { return [] }
+        var kept: [SportHighlight] = []
+        for item in playlist {
+            if let previous = kept.last {
+                let gap = item.apiTimestamp.timeIntervalSince(previous.apiTimestamp)
+                if gap < 90, item.interestRank <= previous.interestRank {
+                    continue
+                }
             }
+            kept.append(item)
         }
-        return spaced
+        return kept
+    }
+
+    private static let openingCeremonyKeywords = [
+        "kickoff", "kick off", "kick-off", "match begins", "first half begins",
+        "start of match", "starts the match", "opening whistle", "underway"
+    ]
+
+    static func isOpeningCeremony(_ highlight: SportHighlight) -> Bool {
+        let haystack = highlight.playDescription.lowercased()
+        return openingCeremonyKeywords.contains { haystack.contains($0) }
     }
 
     /// Seconds to skip forward on the DVR bar from an earlier highlight to a later one.
     static func forwardSecondsBetween(earlier: SportHighlight, later: SportHighlight) -> Int {
         max(1, Int(later.apiTimestamp.timeIntervalSince(earlier.apiTimestamp).rounded()))
+    }
+
+    /// How long to stay on each reel item after the rewind lands (play + aftermath on TV).
+    static func reelWatchSeconds(for highlight: SportHighlight) -> TimeInterval {
+        // ESPN wallclock ≈ when the play is logged — allow the action plus post-play chaos to breathe.
+        let actionOnTV: Double = 14
+        return actionOnTV + postPlayWatchSeconds(for: highlight)
+    }
+
+    /// Extra seconds after the logged moment — longer for cards, penalties, and big incidents.
+    static func postPlayWatchSeconds(for highlight: SportHighlight) -> Double {
+        let haystack = highlight.playDescription.lowercased()
+        if haystack.contains("red card") || haystack.contains("sent off") || haystack.contains("ejected") {
+            return 42
+        }
+        if haystack.contains("var") || haystack.contains("video review") || haystack.contains("penalty") {
+            return 36
+        }
+        if highlight.interestRank >= 3 { return 32 }
+        if highlight.interestRank >= 2 { return 26 }
+        return postPlayPaddingSeconds
+    }
+
+    /// Forward skip after watching `earlier` — land a little before the next highlight's buildup.
+    static func forwardSecondsToNextHighlight(
+        earlier: SportHighlight,
+        later: SportHighlight,
+        watchedSeconds: TimeInterval
+    ) -> Int {
+        let gap = later.apiTimestamp.timeIntervalSince(earlier.apiTimestamp)
+        let consumedFromEarlierStart = max(0, watchedSeconds - prePlayPaddingSeconds)
+        let forward = gap - consumedFromEarlierStart + (prePlayPaddingSeconds * 0.55)
+        return max(20, Int(forward.rounded()))
     }
 
     // MARK: Precision Rewind
@@ -213,6 +303,37 @@ enum SportHighlightEngine {
     }
 
     // MARK: - Private
+
+    private static let broadcastFillerKeywords = [
+        "replay", "instant replay", "video review", "var review", "var check",
+        "booth review", "fox replay", "highlights from", "commercial",
+        "hydration", "water break", "cooling break", "end of half",
+        "end of period", "halftime report", "studio",
+        "replay shows", "shown again", "look again", "after review",
+        "upon further review", "confirmed after", "overturned after"
+    ]
+
+    private static func isSoccerGoal(in haystack: String) -> Bool {
+        if haystack.contains("goal kick") || haystack.contains("no goal") {
+            return false
+        }
+        return haystack.contains("goal") || haystack.contains("scores on") || haystack.contains(" scores")
+    }
+
+    private static func isBroadcastFiller(playDescription: String, play: ESPNPlaySnapshot) -> Bool {
+        let haystack = [
+            playDescription,
+            play.typeText,
+            play.typeAbbreviation
+        ]
+        .compactMap { $0?.lowercased() }
+        .joined(separator: " ")
+
+        if haystack.contains("type") && haystack.contains("replay") { return true }
+        if let abbrev = play.typeAbbreviation?.lowercased(), abbrev == "replay" { return true }
+
+        return broadcastFillerKeywords.contains { haystack.contains($0) }
+    }
 
     private static func containsKeyword(in haystack: String, keywords: [String]) -> Bool {
         keywords.contains { haystack.contains($0) }

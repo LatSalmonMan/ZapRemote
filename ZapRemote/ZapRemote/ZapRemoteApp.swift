@@ -2,16 +2,19 @@
 //  ZapRemoteApp.swift
 //  ZapRemote
 //
-//  Premium automation TV remote — flat $10/mo model.
+//  Premium automation TV remote — flat $5/mo model.
 //
 
 import SwiftUI
 
 @main
 struct ZapRemoteApp: App {
+    @Environment(\.scenePhase) private var scenePhase
+
     @StateObject private var tvController = TVController()
     @StateObject private var sportsAPIService = SportsAPIService()
     @StateObject private var adEventService = AdEventService()
+    @StateObject private var gameNightSession = GameNightSessionManager()
 
     var body: some Scene {
         WindowGroup {
@@ -40,10 +43,12 @@ struct ZapRemoteApp: App {
                 sportsAPIService.configure(tvController: tvController)
                 adEventService.configure(tvController: tvController)
                 adEventService.sportsAPIService = sportsAPIService
-                adEventService.subscribedGameID = sportsAPIService.monitoredGameID
-                adEventService.streamDelayOffsetSeconds = Int(
-                    sportsAPIService.streamDelaySeconds.rounded()
+                gameNightSession.configure(
+                    tvController: tvController,
+                    sportsAPIService: sportsAPIService,
+                    adEventService: adEventService
                 )
+                adEventService.subscribedGameID = sportsAPIService.monitoredGameID
                 if adEventService.isCloudURLConfigured {
                     adEventService.startListening()
                 }
@@ -52,22 +57,22 @@ struct ZapRemoteApp: App {
                     sportsAPIService.startGamePolling()
                 }
             }
-            .onChange(of: sportsAPIService.isHandsFreeAutomationEnabled) { _, enabled in
-                if enabled, adEventService.isCloudURLConfigured {
-                    adEventService.startListening()
-                }
-            }
-            .onChange(of: sportsAPIService.streamDelaySeconds) { _, delay in
-                adEventService.streamDelayOffsetSeconds = Int(delay.rounded())
+            .onChange(of: scenePhase) { _, phase in
+                gameNightSession.handleScenePhase(phase)
             }
             .onChange(of: sportsAPIService.monitoredGameID) { _, newGameID in
                 adEventService.subscribedGameID = newGameID
+                adEventService.syncDetectorConfiguration()
                 let trimmed = newGameID.trimmingCharacters(in: .whitespacesAndNewlines)
                 if trimmed.isEmpty {
                     sportsAPIService.stopGamePolling()
                 } else {
                     sportsAPIService.startLiveGameMonitoring(gameID: trimmed)
                 }
+                gameNightSession.reevaluateSession()
+            }
+            .onChange(of: sportsAPIService.monitoredSportPath) { _, _ in
+                adEventService.syncDetectorConfiguration()
             }
         }
     }

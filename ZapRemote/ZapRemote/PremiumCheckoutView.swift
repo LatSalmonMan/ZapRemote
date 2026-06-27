@@ -2,7 +2,7 @@
 //  PremiumCheckoutView.swift
 //  ZapRemote
 //
-//  Single-tier Stripe checkout — $10/mo premium automation.
+//  Single-tier Stripe checkout — $5/mo premium automation.
 //
 
 import SwiftUI
@@ -40,7 +40,7 @@ struct PremiumCheckoutView: View {
                         .foregroundStyle(.white)
                         .multilineTextAlignment(.center)
 
-                    Text("$10/mo")
+                    Text(ZapRemotePricing.perMonthShort)
                         .font(.system(size: 42, weight: .heavy, design: .rounded))
                         .foregroundStyle(theme.headerGradient)
 
@@ -52,7 +52,7 @@ struct PremiumCheckoutView: View {
                 }
 
                 Button(action: beginCheckout) {
-                    Text("Activate Lifetime Automation Support — $10/mo")
+                    Text("Activate Lifetime Automation Support — \(ZapRemotePricing.perMonthShort)")
                         .font(.headline.weight(.bold))
                         .foregroundStyle(.white)
                         .multilineTextAlignment(.center)
