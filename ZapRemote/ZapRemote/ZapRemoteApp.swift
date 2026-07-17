@@ -2,7 +2,7 @@
 //  ZapRemoteApp.swift
 //  ZapRemote
 //
-//  Premium automation TV remote — flat $5/mo model.
+//  Soccer automation TV remote — flat $1.99/mo.
 //
 
 import SwiftUI
@@ -48,6 +48,7 @@ struct ZapRemoteApp: App {
                     sportsAPIService: sportsAPIService,
                     adEventService: adEventService
                 )
+                _ = sportsAPIService.expireStaleMonitoredGameIfNeeded()
                 adEventService.subscribedGameID = sportsAPIService.monitoredGameID
                 if adEventService.isCloudURLConfigured {
                     adEventService.startListening()
@@ -55,9 +56,15 @@ struct ZapRemoteApp: App {
 
                 if sportsAPIService.hasMonitoredGame {
                     sportsAPIService.startGamePolling()
+                    Task { await sportsAPIService.refreshHighlightsNow() }
                 }
             }
             .onChange(of: scenePhase) { _, phase in
+                if phase == .active {
+                    if sportsAPIService.expireStaleMonitoredGameIfNeeded() {
+                        adEventService.subscribedGameID = ""
+                    }
+                }
                 gameNightSession.handleScenePhase(phase)
             }
             .onChange(of: sportsAPIService.monitoredGameID) { _, newGameID in

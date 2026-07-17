@@ -56,7 +56,7 @@ struct AutomaticRewindExplainerView: View {
                     step: 4,
                     title: "Watch on the big screen",
                     systemImage: "gobackward",
-                    detail: "Long rewinds: the bot clicks fast to hit YouTube TV's 20s skip tier, then slows for a precise 10s landing. Short skips stay at 10s only."
+                    detail: "Each app has its own skip size (e.g. YouTube TV 15s, Hulu/Peacock 10s, FOX One 30s). Clicks are spaced 250ms apart so the scrubber stays accurate."
                 )
 
                 ExplainerStepCard(

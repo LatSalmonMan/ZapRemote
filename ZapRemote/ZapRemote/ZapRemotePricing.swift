@@ -6,8 +6,9 @@
 import Foundation
 
 enum ZapRemotePricing {
-    static let monthlyUSD = 5
+    /// Flat soccer subscription — no Pro tier.
+    static let monthlyUSD = 1.99
 
-    static var perMonthLabel: String { "$\(monthlyUSD) / month" }
-    static var perMonthShort: String { "$\(monthlyUSD)/mo" }
+    static var perMonthLabel: String { "$1.99 / month" }
+    static var perMonthShort: String { "$1.99/mo" }
 }

@@ -2,7 +2,8 @@
 //  TimelineSyncView.swift
 //  ZapRemote
 //
-//  Live: sync TV to ESPN match clock. Replay: TV delay offset only (+seconds).
+//  Live: sync TV delay to ESPN match clock.
+//  Replay: set the match minute on your TV — clock ticks from there like live.
 //
 
 import SwiftUI
@@ -13,7 +14,7 @@ struct TimelineSyncView: View {
     let theme: AppTheme
 
     private var isReplayMode: Bool {
-        !apiService.usesLiveStyleMatchClock
+        apiService.isReplayOffsetMode && !apiService.isNonLiveTestModeEnabled
     }
 
     private var calibrationUnlocked: Bool {
@@ -47,7 +48,7 @@ struct TimelineSyncView: View {
                 if !hasChosenGame {
                     chooseGamePanel
                 } else if isReplayMode {
-                    replayOffsetPanel
+                    replayMinutePanel(now: now)
                 } else {
                     liveSyncPanel(now: now)
                 }
@@ -65,7 +66,7 @@ struct TimelineSyncView: View {
             Text("Choose a game first")
                 .font(.subheadline.weight(.bold))
                 .foregroundStyle(.white.opacity(0.75))
-            Text("Live games sync the match clock. Replays set a TV delay offset only.")
+            Text("Live games sync delay to ESPN. Replays: set the clock on your TV, then it ticks with the game.")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.42))
                 .multilineTextAlignment(.center)
@@ -101,46 +102,10 @@ struct TimelineSyncView: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.55))
 
-            tvClockHero(tvClock: tvClock, now: now)
+            tvClockHero(tvClock: tvClock, now: now, usesDelayNudge: true)
 
-            tvFineTuneRow(step: 5, now: now)
-            tvFineTuneRow(step: 60, minuteLabel: true, now: now)
-
-            lagSlider
-
-            Text(apiService.streamingLagOffsetReadout)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(theme.headerGradient)
-                .multilineTextAlignment(.center)
-        }
-        .padding(18)
-        .background(activeCardBackground)
-    }
-
-    // MARK: - Replay / VOD — delay offset only
-
-    private var replayOffsetPanel: some View {
-        VStack(spacing: 18) {
-            Image(systemName: "play.circle.fill")
-                .font(.title)
-                .foregroundStyle(theme.accentSecondary)
-
-            Text("Replay / VOD")
-                .font(.headline.weight(.bold))
-                .foregroundStyle(.white.opacity(0.88))
-
-            Text("No live clock — set how many seconds your TV is behind ESPN for skip depth. Highlights use a generic test skip, not ESPN timestamps.")
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.45))
-                .multilineTextAlignment(.center)
-
-            Text(SportsAPIService.formatStreamDelayOffset(apiService.streamDelaySeconds))
-                .font(.system(size: 44, weight: .bold, design: .rounded))
-                .foregroundStyle(theme.accentPrimary)
-                .monospacedDigit()
-
-            offsetFineTuneRow(step: 5)
-            offsetFineTuneRow(step: 60, minuteLabel: true)
+            tvFineTuneRow(step: 5, now: now, usesDelayNudge: true)
+            tvFineTuneRow(step: 60, minuteLabel: true, now: now, usesDelayNudge: true)
 
             lagSlider
 
@@ -153,13 +118,53 @@ struct TimelineSyncView: View {
         .background(activeCardBackground)
     }
 
-    private func tvClockHero(tvClock: String, now: Date) -> some View {
+    // MARK: - Replay — set minute, then tick
+
+    private func replayMinutePanel(now: Date) -> some View {
+        let tvClock = apiService.calibratedTVTimelineDisplay(at: now)
+        let hasSeeded = apiService.matchClockTickAnchor != nil
+
+        return VStack(spacing: 18) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(hasSeeded ? Color.green : Color.orange)
+                    .frame(width: 7, height: 7)
+                Text(hasSeeded ? "Replay clock running" : "Where is your TV?")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.white.opacity(0.40))
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(Capsule().fill(Color.white.opacity(0.06)))
+
+            Text("Set the match minute on your screen — clock runs from there like live")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.55))
+                .multilineTextAlignment(.center)
+
+            tvClockHero(tvClock: tvClock, now: now, usesDelayNudge: false)
+
+            tvFineTuneRow(step: 5, now: now, usesDelayNudge: false)
+            tvFineTuneRow(step: 60, minuteLabel: true, now: now, usesDelayNudge: false)
+            tvFineTuneRow(step: 300, minuteLabel: true, now: now, usesDelayNudge: false)
+
+            Text(apiService.streamingLagOffsetReadout)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(theme.headerGradient)
+                .multilineTextAlignment(.center)
+        }
+        .padding(18)
+        .background(activeCardBackground)
+    }
+
+    private func tvClockHero(tvClock: String, now: Date, usesDelayNudge: Bool) -> some View {
         HStack(spacing: 16) {
             nudgeCircle(
                 systemName: "minus",
-                enabled: apiService.canNudgeTVClockDisplay(by: -1, at: now)
+                enabled: canNudgeClock(by: -1, at: now, usesDelayNudge: usesDelayNudge)
             ) {
-                nudgeTVClock(by: -1, at: now)
+                nudgeClock(by: -1, at: now, usesDelayNudge: usesDelayNudge)
             }
 
             VStack(spacing: 4) {
@@ -176,54 +181,41 @@ struct TimelineSyncView: View {
 
             nudgeCircle(
                 systemName: "plus",
-                enabled: apiService.canNudgeTVClockDisplay(by: 1, at: now)
+                enabled: canNudgeClock(by: 1, at: now, usesDelayNudge: usesDelayNudge)
             ) {
-                nudgeTVClock(by: 1, at: now)
+                nudgeClock(by: 1, at: now, usesDelayNudge: usesDelayNudge)
             }
         }
     }
 
     // MARK: - Controls
 
-    private func tvFineTuneRow(step: Int, minuteLabel: Bool = false, now: Date) -> some View {
-        let label = minuteLabel ? "\(step / 60) min" : "\(step)s"
-        let centerLabel = minuteLabel ? "Coarse" : "\(step) sec"
-        return HStack(spacing: 10) {
-            stepChip(label: "−\(label)", enabled: apiService.canNudgeTVClockDisplay(by: -step, at: now)) {
-                nudgeTVClock(by: -step, at: now)
-            }
-            Spacer()
-            Text(centerLabel)
-                .font(.caption2)
-                .foregroundStyle(.white.opacity(0.30))
-            Spacer()
-            stepChip(label: "+\(label)", enabled: apiService.canNudgeTVClockDisplay(by: step, at: now)) {
-                nudgeTVClock(by: step, at: now)
-            }
+    private func tvFineTuneRow(step: Int, minuteLabel: Bool = false, now: Date, usesDelayNudge: Bool) -> some View {
+        let label: String
+        if minuteLabel {
+            label = step >= 60 ? "\(step / 60) min" : "\(step)s"
+        } else {
+            label = "\(step)s"
         }
-    }
-
-    private func offsetFineTuneRow(step: Int, minuteLabel: Bool = false) -> some View {
-        let label = minuteLabel ? "\(step / 60) min" : "\(step)s"
-        let centerLabel = minuteLabel ? "Coarse" : "\(step) sec"
+        let centerLabel = minuteLabel ? (step >= 300 ? "Jump" : "Coarse") : "\(step) sec"
         return HStack(spacing: 10) {
-            stepChip(label: "−\(label)", enabled: apiService.canNudgeStreamDelay(by: -step)) {
-                nudgeOffset(by: -step)
+            stepChip(label: "−\(label)", enabled: canNudgeClock(by: -step, at: now, usesDelayNudge: usesDelayNudge)) {
+                nudgeClock(by: -step, at: now, usesDelayNudge: usesDelayNudge)
             }
             Spacer()
             Text(centerLabel)
                 .font(.caption2)
                 .foregroundStyle(.white.opacity(0.30))
             Spacer()
-            stepChip(label: "+\(label)", enabled: apiService.canNudgeStreamDelay(by: step)) {
-                nudgeOffset(by: step)
+            stepChip(label: "+\(label)", enabled: canNudgeClock(by: step, at: now, usesDelayNudge: usesDelayNudge)) {
+                nudgeClock(by: step, at: now, usesDelayNudge: usesDelayNudge)
             }
         }
     }
 
     private var lagSlider: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(isReplayMode ? "TV offset (seconds)" : "TV delay (seconds)")
+            Text("TV delay (seconds)")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.45))
 
@@ -265,14 +257,20 @@ struct TimelineSyncView: View {
             )
     }
 
-    private func nudgeTVClock(by seconds: Int, at now: Date) {
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        apiService.nudgeTVClockDisplay(by: seconds, at: now)
+    private func canNudgeClock(by seconds: Int, at now: Date, usesDelayNudge: Bool) -> Bool {
+        if usesDelayNudge {
+            return apiService.canNudgeTVClockDisplay(by: seconds, at: now)
+        }
+        return apiService.canNudgeESPNMatchClock(by: seconds, at: now)
     }
 
-    private func nudgeOffset(by seconds: Int) {
+    private func nudgeClock(by seconds: Int, at now: Date, usesDelayNudge: Bool) {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        apiService.nudgeStreamDelay(by: seconds)
+        if usesDelayNudge {
+            apiService.nudgeTVClockDisplay(by: seconds, at: now)
+        } else {
+            apiService.nudgeESPNMatchClock(by: seconds, at: now)
+        }
     }
 
     private func nudgeCircle(systemName: String, enabled: Bool, action: @escaping () -> Void) -> some View {

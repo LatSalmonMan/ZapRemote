@@ -2,7 +2,7 @@
 //  PremiumCheckoutView.swift
 //  ZapRemote
 //
-//  Single-tier Stripe checkout — $5/mo premium automation.
+//  Single-tier Stripe checkout — $1.99/mo soccer automation.
 //
 
 import SwiftUI
@@ -44,7 +44,7 @@ struct PremiumCheckoutView: View {
                         .font(.system(size: 42, weight: .heavy, design: .rounded))
                         .foregroundStyle(theme.headerGradient)
 
-                    Text("Hands-free commercial skipping, AI ad detection, and automatic highlight rewinds on your LG TV.")
+                    Text("Soccer highlights on your LG TV — rewind, watch, return. Built for YouTube TV game nights.")
                         .font(.subheadline)
                         .foregroundStyle(.white.opacity(0.55))
                         .multilineTextAlignment(.center)

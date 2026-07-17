@@ -25,7 +25,7 @@ private enum HomeSessionState: Equatable {
         case .needsTV: "Connect your TV"
         case .pairingTV: "Approve on your TV"
         case .needsGame: "Choose tonight's game"
-        case .waitingForKickoff: "Waiting for kickoff"
+        case .waitingForKickoff: "Waiting for start"
         case .needsLagSync: "Set TV delay"
         case .watchingLive: "You're set"
         case .commercialBreak: "Skipping to highlights"
@@ -40,13 +40,13 @@ private enum HomeSessionState: Equatable {
         case .pairingTV:
             "Accept the pairing prompt on the TV screen."
         case .needsGame:
-            "Search ESPN for the game you're watching on TV."
+            "Search ESPN for the soccer match you're watching on TV."
         case .waitingForKickoff:
-            "Clock starts at 00:00 when the ball is in play on your TV."
+            "Clock starts at 00:00 when the game hits your TV — including your stream delay."
         case .needsLagSync:
-            "Tap + or − until your TV clock matches."
+            "Set Match Clock so highlights line up with your TV."
         case .watchingLive:
-            "Halftime and breaks → highlights on your TV."
+            "Breaks → highlights on your TV."
         case .commercialBreak:
             "Watching highlights — returning to live when done."
         case .attention:
@@ -119,7 +119,7 @@ struct RemoteView: View {
             }
             return .watchingLive
         }
-        if sportsAPIService.isTrackedGameLive, !sportsAPIService.isMatchPhysicallyActive {
+        if sportsAPIService.isWaitingForKickoffOnTV {
             return .waitingForKickoff
         }
         if !sportsAPIService.hasSyncedStreamLag {
@@ -131,14 +131,23 @@ struct RemoteView: View {
         return .watchingLive
     }
 
+    private var heroTitleText: String {
+        if case .waitingForKickoff = sessionState {
+            return sportsAPIService.activeSportProfile.waitingForStartBanner
+                .replacingOccurrences(of: "…", with: "")
+        }
+        return sessionState.heroTitle
+    }
+
     private var heroSubtitleText: String {
+        let sport = sportsAPIService.activeSportProfile
         switch sessionState {
+        case .waitingForKickoff:
+            return "Clock starts at 00:00 when \(sport.startEventNoun) hits your TV — including your stream delay."
         case .needsLagSync where sportsAPIService.isReplayOffsetMode:
-            return "Set how many seconds your replay is behind ESPN (+1 min, +10s, etc.)."
+            return "Set the match minute your replay is on — then the clock ticks like live."
         case .needsLagSync:
             return "ESPN ticks from 00:00 — add seconds until the TV line matches your screen."
-        case .waitingForKickoff:
-            return sessionState.heroSubtitle
         default:
             return sessionState.heroSubtitle
         }
@@ -180,21 +189,20 @@ struct RemoteView: View {
     }
 
     private var rewindStickerPhase: RewindStickerPhase? {
+        switch sportsAPIService.breakSession.phase {
+        case .armed, .rewinding:
+            return .rewinding
+        case .holding:
+            return .watchingHighlight(current: 1, total: 1)
+        case .returning:
+            return .returningToLive
+        case .idle, .cooldown, .error:
+            break
+        }
         if tvController.isReturningToLive {
             return .returningToLive
         }
         if tvController.isMacroRunning || tvController.isExecutingMacro {
-            return .rewinding
-        }
-        if sportsAPIService.pendingAutoGoLive || sportsAPIService.isCommercialBreakLoopActive {
-            let current = sportsAPIService.commercialBreakHighlightIndex
-            let total = sportsAPIService.commercialBreakPlaylist.count
-            if total > 1, current > 0 {
-                return .watchingHighlight(current: current, total: total)
-            }
-            return .watchingHighlight(current: nil, total: nil)
-        }
-        if sportsAPIService.isBreakActive, !sportsAPIService.isCommercialBreakLoopActive {
             return .rewinding
         }
         return nil
@@ -224,16 +232,18 @@ struct RemoteView: View {
                         HomeHeroCard(
                             theme: theme,
                             state: sessionState,
+                            title: heroTitleText,
                             subtitle: heroSubtitleText,
                             streamingService: streamingService,
                             streamDelayLabel: sportsAPIService.streamDelayOffsetLabel,
                             trackedGameLabel: sportsAPIService.monitoredGameLabel,
+                            sportSystemImage: sportsAPIService.activeSportProfile.systemImageName,
                             highlightRank: sportsAPIService.selectedHighlightRank,
                             plannedRewindSeconds: sportsAPIService.lastPlannedRewindSeconds,
                             espnLiveClockLabel: sportsAPIService.espnLiveClockDisplay(at: now)
                                 ?? sportsAPIService.liveGameClockLabel,
                             syncedGameClockLabel: sportsAPIService.uiGameClockDisplay(at: now),
-                            isReplayMode: !sportsAPIService.usesLiveStyleMatchClock,
+                            isReplayMode: sportsAPIService.isReplayOffsetMode && !sportsAPIService.isNonLiveTestModeEnabled,
                             onChangeGame: { isGameSearchPresented = true }
                         )
                     }
@@ -243,8 +253,8 @@ struct RemoteView: View {
                         isTVConnected: tvController.isConnected,
                         isMacroRunning: tvController.isMacroRunning,
                         showSyncLag: sportsAPIService.hasMonitoredGame,
-                        syncLagTitle: sportsAPIService.usesLiveStyleMatchClock ? "Match Clock" : "TV Delay",
-                        syncLagIcon: sportsAPIService.usesLiveStyleMatchClock ? "clock.badge.checkmark" : "timer",
+                        syncLagTitle: "Match Clock",
+                        syncLagIcon: "clock.badge.checkmark",
                         onSyncLag: {
                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
                             isClockSyncPresented = true
@@ -257,6 +267,19 @@ struct RemoteView: View {
                         onAdOnTV: {
                             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                             Task { await sportsAPIService.skipAdToHighlights() }
+                        }
+                    )
+
+                    HighlightBrowserSection(
+                        theme: theme,
+                        highlights: sportsAPIService.highlightsBehindTVPosition(),
+                        isClockSynced: sportsAPIService.hasSyncedStreamLag || sportsAPIService.isNonLiveTestModeEnabled,
+                        isBusy: !sportsAPIService.breakSession.canAcceptAdTap,
+                        emptyHint: sportsAPIService.activeSportProfile.highlightEmptyHint,
+                        sportProfile: sportsAPIService.activeSportProfile,
+                        onSelect: { highlight in
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            Task { await sportsAPIService.rewindToHighlight(highlight) }
                         }
                     )
 
@@ -308,7 +331,7 @@ struct RemoteView: View {
                         .padding(20)
                     }
                 }
-                .navigationTitle(sportsAPIService.usesLiveStyleMatchClock ? "Match Clock" : "TV Delay")
+                .navigationTitle("Match Clock")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .confirmationAction) {
@@ -345,8 +368,9 @@ struct RemoteView: View {
             tvController.statusMessage = "Stopped skip — returning to live…"
         }
 
-        sportsAPIService.clearBreakForManualGoLive()
-        Task { await tvController.executeGoLiveMacro() }
+        Task {
+            await sportsAPIService.performManualGoLive(tvController: tvController)
+        }
     }
 }
 
@@ -497,10 +521,12 @@ private struct HomeConnectionCard: View {
 private struct HomeHeroCard: View {
     let theme: AppTheme
     let state: HomeSessionState
+    let title: String
     let subtitle: String
     let streamingService: StreamingServicePreference
     let streamDelayLabel: String
     var trackedGameLabel: String = ""
+    var sportSystemImage: String = "sportscourt"
     var highlightRank: Int = 0
     var plannedRewindSeconds: Int = 0
     var espnLiveClockLabel: String = "—"
@@ -525,7 +551,7 @@ private struct HomeHeroCard: View {
             }
 
             VStack(spacing: 6) {
-                Text(state.heroTitle)
+                Text(title)
                     .font(.title3.weight(.bold))
                     .foregroundStyle(theme.accentPrimary)
                     .multilineTextAlignment(.center)
@@ -540,7 +566,7 @@ private struct HomeHeroCard: View {
                 onChangeGame?()
             } label: {
                 HStack(spacing: 6) {
-                    Image(systemName: "sportscourt")
+                    Image(systemName: sportSystemImage)
                         .font(.caption.weight(.semibold))
                     Text(trackedGameLabel.isEmpty ? "Choose game" : trackedGameLabel)
                         .font(.caption.weight(.semibold))
@@ -564,7 +590,7 @@ private struct HomeHeroCard: View {
                     }
                     if state == .needsLagSync {
                         if isReplayMode {
-                            heroFact(label: "TV offset", value: streamDelayLabel)
+                            heroFact(label: "TV clock", value: syncedGameClockLabel)
                         } else {
                             if espnLiveClockLabel != "—", espnLiveClockLabel != "Replay" {
                                 heroFact(label: "ESPN", value: espnLiveClockLabel)
@@ -574,10 +600,8 @@ private struct HomeHeroCard: View {
                         }
                     }
                     if state == .watchingLive || state == .commercialBreak {
-                        if isReplayMode {
-                            heroFact(label: "TV offset", value: streamDelayLabel)
-                        } else {
-                            heroFact(label: "TV clock", value: syncedGameClockLabel)
+                        heroFact(label: "TV clock", value: syncedGameClockLabel)
+                        if !isReplayMode {
                             heroFact(label: "Offset", value: streamDelayLabel)
                         }
                     }
@@ -758,6 +782,88 @@ private struct HomeControlButton: View {
         }
         .buttonStyle(.plain)
         .disabled(!isEnabled)
+    }
+}
+
+// MARK: - Highlight browser (tap to rewind)
+
+private struct HighlightBrowserSection: View {
+    let theme: AppTheme
+    let highlights: [SportHighlight]
+    let isClockSynced: Bool
+    let isBusy: Bool
+    var emptyHint: String = "notable plays"
+    var sportProfile: SportProfile = .resolve(sportPath: "soccer/eng.1")
+    let onSelect: (SportHighlight) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Highlights")
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(.white.opacity(0.92))
+                Spacer()
+                Text("\(highlights.count) plays · newest first")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.35))
+            }
+
+            if highlights.isEmpty {
+                Text(isClockSynced
+                     ? "No \(emptyHint) loaded yet."
+                     : "Loading highlights… Sync Match Clock before tapping one.")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.40))
+                    .padding(.vertical, 8)
+            } else {
+                if !isClockSynced {
+                    Text("Sync Match Clock to rewind — list shows all plays so far.")
+                        .font(.caption)
+                        .foregroundStyle(.orange.opacity(0.85))
+                }
+
+                ForEach(highlights) { highlight in
+                    Button {
+                        onSelect(highlight)
+                    } label: {
+                        HStack(alignment: .top, spacing: 12) {
+                            Text(highlight.displayClockLabel(sport: sportProfile))
+                                .font(.subheadline.monospaced().weight(.bold))
+                                .foregroundStyle(theme.accentPrimary)
+                                .frame(width: 52, alignment: .leading)
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(highlight.playDescription)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.white.opacity(0.90))
+                                    .multilineTextAlignment(.leading)
+                                Text(highlight.rankLabel)
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(.white.opacity(0.35))
+                            }
+
+                            Spacer(minLength: 0)
+
+                            Image(systemName: "backward.fill")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.white.opacity(isBusy || !isClockSynced ? 0.2 : 0.45))
+                        }
+                        .padding(14)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(Color.white.opacity(0.07))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isBusy || !isClockSynced)
+                }
+            }
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+        )
     }
 }
 

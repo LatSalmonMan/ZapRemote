@@ -15,8 +15,13 @@ extension StreamingServicePreference {
     var webOSAppID: String {
         switch self {
         case .youtubeTV: "youtube.leanback.ytv.v1"
+        case .primeVideo: "amazon"
+        case .netflix: "netflix"
+        case .appleTVPlus: "com.apple.appletv"
         case .huluLive: "hulu"
+        case .disneyPlus: "com.disney.disneyplus-prod"
         case .peacock: "com.peacocktv.peacock"
+        case .foxOne: "com.fox.foxone"
         case .espnPlus: "com.espn.score_center"
         }
     }

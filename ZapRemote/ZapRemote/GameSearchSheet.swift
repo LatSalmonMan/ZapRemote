@@ -74,7 +74,7 @@ struct GameSearchSheet: View {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.white.opacity(0.35))
 
-                TextField("Argentina, Chiefs, Premier League…", text: $query)
+                TextField("Team or league…", text: $query)
                     .textInputAutocapitalization(.words)
                     .autocorrectionDisabled()
                     .submitLabel(.search)
@@ -106,13 +106,22 @@ struct GameSearchSheet: View {
             )
 
             if !sportsAPIService.monitoredGameLabel.isEmpty {
-                HStack(spacing: 8) {
+                HStack(alignment: .top, spacing: 10) {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(theme.accentPrimary)
                     Text("Tracking: \(sportsAPIService.monitoredGameLabel)")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.white.opacity(0.55))
                         .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Button("Leave") {
+                        sportsAPIService.clearMonitoredGame(reason: "Left game")
+                        dismiss()
+                    }
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(theme.accentPrimary)
+                    .buttonStyle(.plain)
                 }
             }
         }
@@ -200,7 +209,7 @@ struct GameSearchSheet: View {
             Text("Search a team or league")
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.55))
-            Text("Try Argentina, Liverpool, NFL, MLS, Champions League")
+            Text("Try Liverpool, MLS, Champions League, Argentina…")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.35))
                 .multilineTextAlignment(.center)
@@ -269,6 +278,10 @@ private struct GameResultCard: View {
         Button(action: onTap) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
+                    Image(systemName: SportProfile.resolve(sportPath: result.sportPath).systemImageName)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(theme.accentSecondary.opacity(0.9))
+
                     Text(result.leagueLabel.uppercased())
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(theme.accentSecondary.opacity(0.85))

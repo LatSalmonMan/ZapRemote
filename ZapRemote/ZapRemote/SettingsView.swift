@@ -2,15 +2,20 @@
 //  SettingsView.swift
 //  ZapRemote
 //
-//  Account and configuration — premium-only $5/mo model.
+//  Account and configuration — soccer automation $1.99/mo.
 //
 
 import SwiftUI
 
 enum StreamingServicePreference: String, CaseIterable, Identifiable {
     case youtubeTV = "YouTube TV"
+    case primeVideo = "Prime Video"
+    case netflix = "Netflix"
+    case appleTVPlus = "Apple TV+"
     case huluLive = "Hulu Live"
+    case disneyPlus = "Disney+"
     case peacock = "Peacock"
+    case foxOne = "FOX One"
     case espnPlus = "ESPN+"
 
     var id: String { rawValue }
@@ -18,8 +23,13 @@ enum StreamingServicePreference: String, CaseIterable, Identifiable {
     var iconName: String {
         switch self {
         case .youtubeTV: "play.tv.fill"
+        case .primeVideo: "shippingbox.fill"
+        case .netflix: "n.square.fill"
+        case .appleTVPlus: "apple.logo"
         case .huluLive: "tv.fill"
+        case .disneyPlus: "sparkles.tv.fill"
         case .peacock: "play.rectangle.fill"
+        case .foxOne: "dot.radiowaves.left.and.right"
         case .espnPlus: "sportscourt.fill"
         }
     }
@@ -27,18 +37,31 @@ enum StreamingServicePreference: String, CaseIterable, Identifiable {
     var accent: Color {
         switch self {
         case .youtubeTV: Color(red: 0.95, green: 0.18, blue: 0.16)
+        case .primeVideo: Color(red: 0.00, green: 0.66, blue: 0.87)
+        case .netflix: Color(red: 0.90, green: 0.07, blue: 0.14)
+        case .appleTVPlus: Color(red: 0.70, green: 0.70, blue: 0.75)
         case .huluLive: Color(red: 0.22, green: 0.86, blue: 0.44)
+        case .disneyPlus: Color(red: 0.07, green: 0.40, blue: 0.85)
         case .peacock: Color(red: 0.35, green: 0.55, blue: 0.98)
+        case .foxOne: Color(red: 0.12, green: 0.35, blue: 0.85)
         case .espnPlus: Color(red: 0.98, green: 0.72, blue: 0.18)
         }
     }
 
+    /// Must match `StreamingAppSkipProfile` — shown under the Settings picker.
     var macroBehaviorNote: String {
-        switch self {
-        case .youtubeTV: "10s skip steps (1 click/sec)"
-        case .huluLive, .peacock: "10s skip steps"
-        case .espnPlus: "Skip timing not mapped yet"
+        let profile = StreamingAppSkipProfile.profile(for: webOSAppID)
+        guard let seconds = profile.secondsPerClick else {
+            return "Skip timing not mapped yet — rewind disabled"
         }
+        if self == .youtubeTV {
+            return "\(seconds)s/click · \(profile.clickSpacingMs)ms apart · +170ms every 14 · keep \(rawValue) in front"
+        }
+        return "\(seconds)s/click · \(profile.clickSpacingMs)ms between clicks · keep \(rawValue) in front"
+    }
+
+    var skipSecondsPerClick: Int? {
+        StreamingAppSkipProfile.profile(for: webOSAppID).secondsPerClick
     }
 }
 
@@ -53,6 +76,9 @@ struct SettingsView: View {
 
     @AppStorage(SportsAPIStorageKey.highlightWatchSeconds)
     private var highlightWatchSeconds: Double = 0
+
+    @AppStorage(FootballDataStorageKey.apiToken)
+    private var footballDataAPIToken: String = ""
 
     @State private var isCheckoutSheetPresented = false
     @State private var isAdvancedExpanded = false
@@ -72,7 +98,7 @@ struct SettingsView: View {
 
     private var highlightWatchLabel: String {
         if highlightWatchSeconds <= 0 {
-            return "Auto — goals ~22s, big plays ~18s, other ~14s (TV icon stays for whole reel)"
+            return "Auto — 45s hold after each highlight (Phase 0 reliability)"
         }
         return "Each highlight stays on TV for \(Int(highlightWatchSeconds))s (icon stays for whole reel)"
     }
@@ -131,6 +157,31 @@ struct SettingsView: View {
             isExpanded: $isAdvancedExpanded
         ) {
             VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("football-data.org API token")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.45))
+
+                    SecureField("X-Auth-Token", text: $footballDataAPIToken)
+                        .font(.caption.monospaced())
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .padding(12)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color.white.opacity(0.06))
+                        )
+                        .onChange(of: footballDataAPIToken) { _, newValue in
+                            FootballDataClient.apiToken = newValue
+                        }
+
+                    Text("Required for soccer games + goals/cards. Get a free token at football-data.org — deep data (goals/bookings) needs a paid plan.")
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.40))
+                }
+
+                Divider().overlay(Color.white.opacity(0.08))
+
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Mac ad detector (optional)")
                         .font(.caption.weight(.semibold))
@@ -457,7 +508,7 @@ private struct PremiumSubscriptionCard: View {
                         .font(.title2.weight(.bold))
                         .foregroundStyle(theme.headerGradient)
 
-                    Text("Live sports on autopilot")
+                    Text("Soccer highlights on autopilot")
                         .font(.footnote)
                         .foregroundStyle(.white.opacity(0.48))
                 }

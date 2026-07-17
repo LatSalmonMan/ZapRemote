@@ -60,35 +60,96 @@ enum LGConnectionPhase: Equatable, Sendable {
 /// Per-app rewind granularity for the dynamic macro skip engine.
 enum StreamingAppSkipProfile: Sendable {
     case youtubeTV      // 15s per LEFT
+    case primeVideo     // 10s per LEFT
+    case netflix        // 10s per LEFT
+    case appleTVPlus    // 10s per LEFT
     case hulu           // 10s per LEFT
+    case disneyPlus     // 10s per LEFT
     case peacock        // 10s per LEFT
+    case foxOne         // 30s per LEFT (FOX One live / DVR scrub)
+    case espnPlus       // 10s per LEFT
     case unsupported
 
     var secondsPerClick: Int? {
         switch self {
         case .youtubeTV: 15
-        case .hulu, .peacock: 10
+        case .primeVideo, .netflix, .appleTVPlus, .hulu, .disneyPlus, .peacock, .espnPlus: 10
+        case .foxOne: 30
         case .unsupported: nil
         }
     }
 
-    /// Delay between skip keys — YouTube TV drops inputs if we fire too fast.
+    /// Delay between skip keys — YouTube TV fine-tuned on device.
     var clickSpacingMs: Int {
         switch self {
-        case .youtubeTV: 500
-        case .hulu, .peacock: 400
+        case .youtubeTV: 200
         case .unsupported: 400
+        default: 350
         }
     }
 
-    /// Maps LG `appId` strings to skip behavior.
-    static func profile(for appID: String) -> StreamingAppSkipProfile {
-        switch appID {
-        case "youtube.leanback.ytv.v1": .youtubeTV
-        case "hulu": .hulu
-        case "com.peacocktv.peacock": .peacock
-        default: .unsupported
+    var displayName: String {
+        switch self {
+        case .youtubeTV: "YouTube TV"
+        case .primeVideo: "Prime Video"
+        case .netflix: "Netflix"
+        case .appleTVPlus: "Apple TV+"
+        case .hulu: "Hulu"
+        case .disneyPlus: "Disney+"
+        case .peacock: "Peacock"
+        case .foxOne: "FOX One"
+        case .espnPlus: "ESPN+"
+        case .unsupported: "unsupported app"
         }
+    }
+
+    /// Maps LG `appId` strings to skip behavior (includes legacy aliases).
+    static func profile(for appID: String) -> StreamingAppSkipProfile {
+        let id = appID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !id.isEmpty else { return .unsupported }
+
+        switch id {
+        case "youtube.leanback.ytv.v1", "youtube.leanback.v4":
+            return .youtubeTV
+        case "amazon", "amazon.primevideo", "com.amazon.amazonvideo.livingroom",
+             "com.amazon.aiv.AIVApp":
+            return .primeVideo
+        case "netflix", "com.netflix.app":
+            return .netflix
+        case "com.apple.appletv", "appletvplus", "com.apple.atve.appletv":
+            return .appleTVPlus
+        case "hulu", "hulu-tv", "com.hulu.plus":
+            return .hulu
+        case "com.disney.disneyplus-prod", "com.disney.disneyplus", "disneyplus":
+            return .disneyPlus
+        case "com.peacocktv.peacock", "peacock":
+            return .peacock
+        case "com.fox.foxone", "com.fox.now", "com.foxsports.foxsports",
+             "fox.sports", "foxsports", "foxone":
+            return .foxOne
+        case "com.espn.score_center", "espn", "com.espn.espn":
+            return .espnPlus
+        default:
+            break
+        }
+
+        // Soft match — LG sometimes ships variant IDs per region / firmware.
+        if id.contains("youtube") && (id.contains("ytv") || id.contains("leanback")) {
+            return .youtubeTV
+        }
+        if id.contains("amazon") || id.contains("primevideo") || id.contains("aiv") {
+            return .primeVideo
+        }
+        if id.contains("netflix") { return .netflix }
+        if id.contains("apple") && id.contains("tv") { return .appleTVPlus }
+        if id.contains("hulu") { return .hulu }
+        if id.contains("disney") { return .disneyPlus }
+        if id.contains("peacock") { return .peacock }
+        if id.contains("foxone") || id.contains("fox.one") || id.contains("foxsports") || id.contains("fox.sports") {
+            return .foxOne
+        }
+        if id.contains("espn") { return .espnPlus }
+        return .unsupported
     }
 }
 
@@ -179,6 +240,29 @@ final class TVController: ObservableObject {
     private static let maxMacroClicks = 14
     /// Hard cooldown after rewind — blocks duplicate triggers so the LG TV doesn't jam.
     private static let macroCooldownSeconds: TimeInterval = 4.0
+    /// Extra settle pause after every N skip clicks (resets seek acceleration / UI lag).
+    private static let defaultSkipBurstSize = 6
+    private static let defaultSkipBurstBreatherMs = 250
+    private static let youtubeTVSkipBurstSize = 6
+    private static let youtubeTVSkipBurstBreatherMs = 350
+
+    private func resolvedSkipBurstSize() -> Int {
+        isUsingYouTubeTVSkipProfile ? Self.youtubeTVSkipBurstSize : Self.defaultSkipBurstSize
+    }
+
+    private func resolvedSkipBurstBreatherMs() -> Int {
+        isUsingYouTubeTVSkipProfile ? Self.youtubeTVSkipBurstBreatherMs : Self.defaultSkipBurstBreatherMs
+    }
+
+    private var isUsingYouTubeTVSkipProfile: Bool {
+        let current = StreamingAppSkipProfile.profile(for: currentAppID)
+        if current == .youtubeTV { return true }
+        if !preferredStreamingAppID.isEmpty,
+           StreamingAppSkipProfile.profile(for: preferredStreamingAppID) == .youtubeTV {
+            return true
+        }
+        return false
+    }
     private static let foregroundPollIntervalSeconds: UInt64 = 2
     private static let discoveryScanSeconds: UInt64 = 5
     private static let pairingTimeoutSeconds: UInt64 = 45
@@ -548,7 +632,7 @@ final class TVController: ObservableObject {
 
     /// Sends a calculated sequence of LEFT presses to rewind by `targetSeconds`.
     ///
-    /// YouTube TV uses 5-click micro-bursts; other apps use steady `clickSpacingMs` skips.
+    /// Phase 0: always steady spaced clicks (reliability over speed). Micro-burst is disabled.
     @discardableResult
     func triggerRewindMacro(
         targetSeconds: Int,
@@ -568,7 +652,7 @@ final class TVController: ObservableObject {
 
         guard resolvedSecondsPerClick() != nil else {
             let appLabel = currentAppID.isEmpty ? "unknown app" : currentAppID
-            statusMessage = "Open YouTube TV, Hulu, or Peacock on your TV (now: \(appLabel))."
+            statusMessage = "Open a supported streaming app on your TV (now: \(appLabel))."
             return false
         }
 
@@ -589,18 +673,13 @@ final class TVController: ObservableObject {
         return nil
     }
 
+    /// Phase 0: micro-burst disabled — uncalibrated bursts caused under/over rewind.
     private func usesYouTubeTVMicroBurst(for direction: String) -> Bool {
-        guard direction == "LEFT" else { return false }
-        if StreamingAppSkipProfile.profile(for: currentAppID) == .youtubeTV { return true }
-        if currentAppID.isEmpty,
-           !preferredStreamingAppID.isEmpty,
-           StreamingAppSkipProfile.profile(for: preferredStreamingAppID) == .youtubeTV {
-            return true
-        }
+        _ = direction
         return false
     }
 
-    /// YouTube TV = 15s, Hulu/Peacock = 10s per LEFT/RIGHT skip.
+    /// Per-app skip size: YTTV 15s, FOX 30s, most others 10s.
     func secondsPerSkipClick() -> Int {
         resolvedSecondsPerClick() ?? 15
     }
@@ -660,7 +739,7 @@ final class TVController: ObservableObject {
         if !preferredStreamingAppID.isEmpty {
             return StreamingAppSkipProfile.profile(for: preferredStreamingAppID).clickSpacingMs
         }
-        return 450
+        return 300
     }
 
     /// Returns to the live edge using the exact click count from the last rewind.
@@ -703,60 +782,93 @@ final class TVController: ObservableObject {
 
     // MARK: 5b — THE "JUMP TO LIVE" RESET MACRO
 
-    /// Returns to the live edge — re-opens the YTTV scrub bar, then RIGHT-clicks forward.
-    /// Pass `forwardClicks` when the caller computed drift-aware catch-up (multi-highlight breaks).
-    func executeGoLiveMacro(forwardClicks overrideClicks: Int? = nil) async {
-        guard connectionPhase == .ready, pointerWebSocket != nil else {
+    /// Returns to the live edge — re-opens the scrub bar, then RIGHT-clicks forward.
+    /// Pass `forwardClicks` when the caller computed catch-up.
+    /// `skipOpeningLeft`: highlight return uses Click only — LEFT would undo a skip of watch credit.
+    /// `uninterruptible`: finish every RIGHT even if the Task was cancelled.
+    func executeGoLiveMacro(
+        forwardClicks overrideClicks: Int? = nil,
+        uninterruptible: Bool = false,
+        skipOpeningLeft: Bool = false
+    ) async {
+        guard connectionPhase == .ready else {
             statusMessage = "Connect to the TV before jumping to live."
+            print("🛑 executeGoLiveMacro aborted — not connected")
             return
         }
 
         cancelActiveMacro()
+        isExecutingMacro = false
 
-        let secondsPerClick = resolvedSecondsPerClick() ?? 15
         let clicks: Int
-        if let override = overrideClicks, override > 0 {
-            clicks = override
+        if let override = overrideClicks {
+            clicks = max(0, override)
         } else {
-            var base = lastRewindClickCount
-            if let finishedAt = lastRewindMacroFinishedAt {
-                let drift = Int(ceil(Date().timeIntervalSince(finishedAt) / Double(secondsPerClick)))
-                base += drift
-            }
-            clicks = min(Self.maxMacroClicks, max(1, base + 2))
+            // Highlight return always passes an override. Bare fallback = exact undo, no +drift/+2.
+            clicks = max(1, lastRewindClickCount)
         }
 
         guard clicks > 0 else {
-            statusMessage = "Nothing to undo — tap Ad on my TV first, then Go Live."
+            statusMessage = "Nothing to undo — already at the target position."
+            print("🛑 executeGoLiveMacro aborted — 0 clicks")
             return
         }
 
-        guard await refreshPointerInputSocket() else {
+        var socketOK = await refreshPointerInputSocket()
+        if !socketOK {
+            try? await Task.sleep(for: .milliseconds(400))
+            socketOK = await refreshPointerInputSocket()
+        }
+        guard socketOK else {
             statusMessage = "TV input channel lost — tap Reset and reconnect."
+            print("🛑 executeGoLiveMacro aborted — pointer socket lost")
             return
         }
 
         isMacroRunning = true
         isReturningToLive = true
-        statusMessage = "Returning to live (\(clicks)× forward)…"
+        statusMessage = "Returning (\(clicks)× forward)…"
+        print(
+            "⏩ executeGoLiveMacro START — \(clicks)× RIGHT "
+            + "(uninterruptible=\(uninterruptible), skipLeft=\(skipOpeningLeft))"
+        )
 
         defer {
             isMacroRunning = false
             isReturningToLive = false
         }
 
-        // After rewind + ENTER the scrubber closes — open it again before RIGHT skips.
+        // Re-open scrubber. Highlight auto-return: Click only (no LEFT) so
+        // `rewindClicks − floor(watch/15)` lands correctly.
         sendPointerClick()
         try? await Task.sleep(for: .milliseconds(450))
-        sendPointerButton("LEFT")
-        try? await Task.sleep(for: .milliseconds(550))
+        if !skipOpeningLeft {
+            sendPointerButton("LEFT")
+            try? await Task.sleep(for: .milliseconds(550))
+        } else {
+            try? await Task.sleep(for: .milliseconds(300))
+        }
 
         let spacingMs = resolvedClickSpacingMs()
+        var sent = 0
         for index in 0..<clicks {
-            guard !Task.isCancelled, connectionPhase == .ready else { return }
+            if !uninterruptible {
+                guard !Task.isCancelled, connectionPhase == .ready else {
+                    print("🛑 executeGoLiveMacro cancelled after \(sent)/\(clicks) RIGHT")
+                    return
+                }
+            } else if connectionPhase != .ready {
+                print("🛑 executeGoLiveMacro lost connection after \(sent)/\(clicks) RIGHT")
+                return
+            }
             sendPointerButton("RIGHT")
+            sent += 1
             if index < clicks - 1 {
-                try? await Task.sleep(for: .milliseconds(spacingMs))
+                var pauseMs = spacingMs
+                if (index + 1) % resolvedSkipBurstSize() == 0 {
+                    pauseMs += resolvedSkipBurstBreatherMs()
+                }
+                try? await Task.sleep(for: .milliseconds(pauseMs))
             }
         }
 
@@ -766,15 +878,72 @@ final class TVController: ObservableObject {
         lastRewindClickCount = 0
         lastRewindMacroFinishedAt = nil
         isExecutingMacro = false
-        statusMessage = "Returned to live — \(clicks)× forward, confirmed."
+        statusMessage = "Returned — \(sent)× forward, confirmed."
+        print("⏩ executeGoLiveMacro DONE — \(sent)× RIGHT sent")
+    }
+
+    /// Waits until skip keys finish sending. Does NOT wait on the post-rewind cooldown lock
+    /// (`isExecutingMacro`) — that was blocking highlight return for 4s and racing the hold FSM.
+    func waitForMacroKeysToFinish() async {
+        while isMacroRunning {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
     }
 
     /// Waits for an in-flight macro and a short post-skip settle window.
     func waitForMacroCycleToFinish() async {
-        while isMacroRunning || isExecutingMacro {
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
+        await waitForMacroKeysToFinish()
         try? await Task.sleep(nanoseconds: 1_500_000_000)
+    }
+
+    /// Drops the post-rewind lock so Go Live can run immediately after a highlight watch.
+    func unlockMacroForReturn() {
+        isExecutingMacro = false
+    }
+
+    /// Highlight auto-return — same Click→skip→ENTER path as rewind, direction RIGHT.
+    func executeHighlightReturnMacro(forwardClicks: Int) async {
+        let clicks = max(1, forwardClicks)
+        guard connectionPhase == .ready else {
+            statusMessage = "Connect to the TV before returning."
+            print("🛑 executeHighlightReturnMacro aborted — not connected")
+            return
+        }
+
+        unlockMacroForReturn()
+
+        // Soft refresh only — do NOT tear down a healthy pointer socket mid-session.
+        var socketOK = await refreshPointerInputSocket()
+        if !socketOK {
+            try? await Task.sleep(for: .milliseconds(400))
+            socketOK = await refreshPointerInputSocket()
+        }
+        guard socketOK else {
+            statusMessage = "TV input channel lost — tap Reset and reconnect."
+            print("🛑 executeHighlightReturnMacro aborted — pointer socket lost")
+            return
+        }
+
+        isExecutingMacro = true
+        isReturningToLive = true
+        let spc = secondsPerSkipClick()
+        print("⏩ executeHighlightReturnMacro START — \(clicks)× RIGHT via rewind macro path")
+
+        runPointerMacro(
+            direction: "RIGHT",
+            targetSeconds: clicks * spc,
+            totalClicks: clicks,
+            actionLabel: "Returning",
+            statusLabel: "Returning (\(clicks)× RIGHT)…",
+            clearsRewindLedger: true
+        )
+
+        await waitForMacroKeysToFinish()
+        isReturningToLive = false
+        isExecutingMacro = false
+        lastRewindClickCount = 0
+        lastRewindMacroFinishedAt = nil
+        print("⏩ executeHighlightReturnMacro DONE — waited for \(clicks)× RIGHT")
     }
 
     /// Skips forward on the DVR scrub bar — decrements the live-edge ledger per click.
@@ -817,7 +986,11 @@ final class TVController: ObservableObject {
             sendPointerButton("RIGHT")
             lastRewindClickCount = max(0, lastRewindClickCount - 1)
             if index < totalClicks - 1 {
-                try? await Task.sleep(for: .milliseconds(spacingMs))
+                var pauseMs = spacingMs
+                if (index + 1) % resolvedSkipBurstSize() == 0 {
+                    pauseMs += resolvedSkipBurstBreatherMs()
+                }
+                try? await Task.sleep(for: .milliseconds(pauseMs))
             }
         }
 
@@ -924,10 +1097,16 @@ final class TVController: ObservableObject {
             return
         }
 
-        if direction == "LEFT" {
-            pendingHighlightBanner = nil
+        // Same scrubber open for rewind (LEFT) and return (RIGHT) — Click then wait.
+        if direction == "LEFT" || direction == "RIGHT" {
+            if direction == "LEFT" {
+                pendingHighlightBanner = nil
+            }
             sendPointerClick()
-            try? await Task.sleep(for: .milliseconds(450))
+            let openMs = StreamingAppSkipProfile.profile(
+                for: currentAppID.isEmpty ? preferredStreamingAppID : currentAppID
+            ) == .youtubeTV ? 550 : 320
+            try? await Task.sleep(for: .milliseconds(openMs))
         }
 
         if usesYouTubeTVMicroBurst(for: direction) {
@@ -956,7 +1135,12 @@ final class TVController: ObservableObject {
             }
 
             if index < totalClicks - 1 {
-                try? await Task.sleep(for: .milliseconds(spacingMs))
+                var pauseMs = spacingMs
+                // Every 6 clicks, add a short breather so seek tier / UI can settle.
+                if (index + 1) % resolvedSkipBurstSize() == 0 {
+                    pauseMs += resolvedSkipBurstBreatherMs()
+                }
+                try? await Task.sleep(for: .milliseconds(pauseMs))
             }
         }
 
@@ -972,11 +1156,15 @@ final class TVController: ObservableObject {
         }
 
         statusMessage = "\(actionLabel) complete — \(totalClicks)× \(direction), confirmed."
+        print("⏩ TVController: \(actionLabel) DONE — \(totalClicks)× \(direction)")
 
         if direction == "LEFT" {
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.macroCooldownSeconds) { [weak self] in
                 self?.isExecutingMacro = false
             }
+        } else if direction == "RIGHT" {
+            // Return macros hold the lock for the send — drop it as soon as keys finish.
+            isExecutingMacro = false
         }
     }
 
@@ -1110,10 +1298,9 @@ final class TVController: ObservableObject {
         }
     }
 
-    /// Releases the rewind safety lock immediately. Only meaningful for the LEFT
-    /// (rewind) direction — RIGHT/live-return macros don't touch `isExecutingMacro`.
+    /// Releases the macro safety lock (rewind LEFT or return RIGHT).
     private func releaseProcessingMacroLock(direction: String) {
-        guard direction == "LEFT" else { return }
+        _ = direction
         isExecutingMacro = false
     }
 

@@ -94,6 +94,17 @@ enum TimelineOffsetEngine {
         return max(1, Int(finalCalculatedRewind.rounded()))
     }
 
+    /// Minute-based rewind: how far back from the user's current TV match clock to the highlight.
+    /// Prefer this for football-data.org events (no wall-clock timestamps).
+    static func rewindSeconds(
+        tvElapsedSeconds: Int,
+        highlightElapsedSeconds: Int,
+        leadSeconds: Double = rewindLeadSeconds
+    ) -> Int {
+        let delta = Double(tvElapsedSeconds - highlightElapsedSeconds) + leadSeconds
+        return max(1, Int(delta.rounded()))
+    }
+
     /// Wall-clock instant that maps to what the user's delayed TV feed is showing now.
     static func tvTimelineMoment(now: Date = Date(), streamDelaySeconds: Double) -> Date {
         now.addingTimeInterval(-streamDelaySeconds)
@@ -136,21 +147,11 @@ enum GameClockSyncEngine {
     }
 
     static func clockMode(for sportPath: String) -> GameClockMode {
-        let path = sportPath.lowercased()
-        if path.contains("soccer") || path.contains("fifa") {
-            return .countUp
-        }
-        return .countDown
+        SportProfile.resolve(sportPath: sportPath).clockMode
     }
 
     static func periodShortName(_ period: Int, sportPath: String) -> String {
-        let path = sportPath.lowercased()
-        if path.contains("soccer") || path.contains("fifa") {
-            return period <= 1 ? "1H" : "2H"
-        }
-        if period <= 0 { return "—" }
-        if period <= 4 { return "Q\(period)" }
-        return "OT"
+        SportProfile.resolve(sportPath: sportPath).periodShortName(period)
     }
 
     /// Formats seconds remaining in a period (NFL/NBA countdown).
@@ -168,11 +169,7 @@ enum GameClockSyncEngine {
     }
 
     static func periodLengthSeconds(sportPath: String, period: Int) -> Int {
-        let path = sportPath.lowercased()
-        if path.contains("soccer") || path.contains("fifa") { return 45 * 60 }
-        if path.contains("basketball") { return 12 * 60 }
-        if path.contains("hockey") { return 20 * 60 }
-        return 15 * 60
+        SportProfile.resolve(sportPath: sportPath).periodLengthSeconds(period: period)
     }
 
     /// ESPN 2H soccer clocks often use match minutes (`75'`) or elapsed seconds (`4500`).
@@ -182,9 +179,9 @@ enum GameClockSyncEngine {
         period: Int,
         sportPath: String
     ) -> Int {
-        let path = sportPath.lowercased()
-        guard path.contains("soccer") || path.contains("fifa") else { return clockSeconds }
-        let halfLength = periodLengthSeconds(sportPath: sportPath, period: 1)
+        let profile = SportProfile.resolve(sportPath: sportPath)
+        guard profile.kind == .soccer else { return clockSeconds }
+        let halfLength = profile.periodLengthSeconds(period: 1)
         guard period >= 2, clockSeconds >= halfLength else { return clockSeconds }
         return clockSeconds - halfLength
     }
@@ -249,16 +246,17 @@ enum GameClockSyncEngine {
         statusDetail: String? = nil
     ) -> ESPNGameClock? {
         var resolvedPeriod = period ?? 0
-        let mode = clockMode(for: sportPath)
+        let profile = SportProfile.resolve(sportPath: sportPath)
+        let mode = profile.clockMode
         if resolvedPeriod <= 0 {
-            let path = sportPath.lowercased()
-            if path.contains("soccer") || path.contains("fifa") {
+            switch profile.kind {
+            case .soccer, .americanFootball, .basketball, .hockey, .unknown:
                 resolvedPeriod = 1
-            } else if path.contains("football") || path.contains("basketball") || path.contains("hockey") {
+            case .baseball:
                 resolvedPeriod = 1
             }
         }
-        let maxPeriod = periodLengthSeconds(sportPath: sportPath, period: max(resolvedPeriod, 1))
+        let maxPeriod = max(1, profile.periodLengthSeconds(period: max(resolvedPeriod, 1)))
 
         let seconds: Int?
         // Prefer ESPN's display string (Q3 8:45) over the raw `clock` number — it is often wrong.
@@ -285,10 +283,9 @@ enum GameClockSyncEngine {
         guard let parsedSeconds = seconds else { return nil }
 
         if resolvedPeriod <= 0 {
-            let path = sportPath.lowercased()
-            if path.contains("soccer") || path.contains("fifa") {
+            if profile.kind == .soccer {
                 resolvedPeriod = parsedSeconds > 45 * 60 ? 2 : 1
-            } else if path.contains("football") || path.contains("basketball") || path.contains("hockey") {
+            } else {
                 resolvedPeriod = 1
             }
         }
@@ -305,7 +302,7 @@ enum GameClockSyncEngine {
             clockSeconds = min(parsedSeconds, maxPeriod)
         }
 
-        let label = periodShortName(resolvedPeriod, sportPath: sportPath)
+        let label = profile.periodShortName(resolvedPeriod)
         let display: String
         switch mode {
         case .countDown:
@@ -364,21 +361,12 @@ enum GameClockSyncEngine {
         return String(format: "%d:%02d", minutes, remainder)
     }
 
-    /// Normalizes ESPN period clocks into one elapsed match timer (count-up).
+    /// Normalizes ESPN period clocks into one elapsed match timer.
     static func elapsedGameSeconds(from clock: ESPNGameClock, sportPath: String) -> Int {
-        let path = sportPath.lowercased()
-        if path.contains("soccer") || path.contains("fifa") {
-            let halfLength = 45 * 60
-            return clock.period <= 1 ? clock.clockSeconds : halfLength + clock.clockSeconds
-        }
-        if path.contains("basketball") {
-            let periodLength = 12 * 60
-            let elapsedInPeriod = periodLength - clock.clockSeconds
-            return (clock.period - 1) * periodLength + elapsedInPeriod
-        }
-        let periodLength = 15 * 60
-        let elapsedInPeriod = periodLength - clock.clockSeconds
-        return (clock.period - 1) * periodLength + elapsedInPeriod
+        SportProfile.resolve(sportPath: sportPath).elapsedGameSeconds(
+            period: clock.period,
+            clockSeconds: clock.clockSeconds
+        )
     }
 
     static func elapsedMinutesLabel(from clock: ESPNGameClock, sportPath: String) -> String {

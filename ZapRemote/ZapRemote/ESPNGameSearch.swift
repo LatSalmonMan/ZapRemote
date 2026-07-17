@@ -69,25 +69,21 @@ enum ESPNGameSearchService {
         ScoreboardSpec(sport: "soccer", league: "uefa.nations", label: "UEFA Nations League"),
     ]
 
-    private static let usSportsScoreboards: [ScoreboardSpec] = [
+    /// Deferred until soccer is solid — Phase 2 NFL wedge only.
+    private static let nflScoreboards: [ScoreboardSpec] = [
         ScoreboardSpec(sport: "football", league: "nfl", label: "NFL"),
-        ScoreboardSpec(sport: "basketball", league: "nba", label: "NBA"),
-        ScoreboardSpec(sport: "baseball", league: "mlb", label: "MLB"),
-        ScoreboardSpec(sport: "hockey", league: "nhl", label: "NHL"),
-        ScoreboardSpec(sport: "football", league: "college-football", label: "College Football"),
-        ScoreboardSpec(sport: "basketball", league: "mens-college-basketball", label: "Men's CBB"),
-        ScoreboardSpec(sport: "basketball", league: "womens-college-basketball", label: "Women's CBB"),
-        ScoreboardSpec(sport: "baseball", league: "college-baseball", label: "College Baseball"),
     ]
 
-    private static var allScoreboards: [ScoreboardSpec] {
-        soccerScoreboards + usSportsScoreboards
+    /// Phase 0: soccer scoreboards only (basketball/MLB/NHL not product).
+    private static var activeScoreboards: [ScoreboardSpec] {
+        soccerScoreboards
     }
 
     private static func scoreboards(forSport sport: String?) -> [ScoreboardSpec] {
-        guard let sport else { return allScoreboards }
+        guard let sport else { return activeScoreboards }
         if sport == "soccer" { return soccerScoreboards }
-        return allScoreboards.filter { $0.sport == sport }
+        if sport == "football" { return nflScoreboards } // unused until Phase 2
+        return soccerScoreboards
     }
 
     // MARK: - Public
@@ -96,7 +92,7 @@ enum ESPNGameSearchService {
         var results: [ESPNGameSearchResult] = []
         var seen = Set<String>()
 
-        for board in allScoreboards {
+        for board in activeScoreboards {
             guard let games = try? await fetchScoreboard(
                 spec: board,
                 dates: scoreboardDateRange(pastDays: 1, futureDays: 1),
@@ -132,6 +128,8 @@ enum ESPNGameSearchService {
 
             for item in searchItems.prefix(12) {
                 guard let sport = item.sport else { continue }
+                // Phase 0: ignore NFL/NBA/etc. from ESPN search hits.
+                guard sport == "soccer" else { continue }
                 searchedSports.insert(sport)
 
                 if item.type == "team", let teamID = item.id {
@@ -197,7 +195,11 @@ enum ESPNGameSearchService {
             throw lastError
         }
 
-        return sortResults(results)
+        let soccerOnly = results.filter {
+            $0.sportPath.lowercased().contains("soccer")
+                || $0.sportPath.lowercased().contains("fifa")
+        }
+        return sortResults(soccerOnly)
     }
 
     // MARK: - Search API
@@ -494,13 +496,11 @@ enum ESPNGameSearchService {
         tokens: [String],
         searchedSports: Set<String>
     ) -> [ScoreboardSpec] {
-        if searchedSports.contains("soccer") || looksLikeSoccerQuery(query, tokens: tokens) {
-            return soccerScoreboards + usSportsScoreboards
-        }
-        if searchedSports.contains("football") && !searchedSports.contains("soccer") {
-            return usSportsScoreboards.filter { $0.sport == "football" } + soccerScoreboards
-        }
-        return allScoreboards
+        _ = query
+        _ = tokens
+        _ = searchedSports
+        // Phase 0: soccer boards only.
+        return soccerScoreboards
     }
 
     private static func looksLikeSoccerQuery(_ query: String, tokens: [String]) -> Bool {
