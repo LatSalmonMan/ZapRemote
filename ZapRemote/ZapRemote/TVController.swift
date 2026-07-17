@@ -11,7 +11,7 @@
 //    4. openPointerSocket()    — secondary socket for button/input commands
 //    5. fetchActiveAppID()     — foreground app tracking for macro engine
 //    6. triggerRewindMacro()   — app-aware LEFT-click automation (isExecutingMacro-locked)
-//    7. executeGoLiveMacro()   — native seek-overlay "Jump to Live" reset
+//    7. runForwardMacro()      — Click → RIGHT×N → ENTER (post-highlight return)
 //    8. sendLGTVToastNotification() — on-TV toast via createToast SSAP URI
 //
 
@@ -236,7 +236,7 @@ final class TVController: ObservableObject {
     private static let webOSPort = 3000
     private static let clientKeyStorageKey = "com.zapremote.lg.clientKey"
     private static let lastTVIPStorageKey = TVControllerStorageKey.lastTVIP
-    /// Caps generic test skips and quick Go Live nudges — not highlight rewinds.
+    /// Caps generic test skips — not highlight rewinds.
     private static let maxMacroClicks = 14
     /// Hard cooldown after rewind — blocks duplicate triggers so the LG TV doesn't jam.
     private static let macroCooldownSeconds: TimeInterval = 4.0
@@ -742,177 +742,18 @@ final class TVController: ObservableObject {
         return 300
     }
 
-    /// Returns to the live edge using the exact click count from the last rewind.
-    /// Only call once game action is back — jumping to live during a break lands on ads.
-    func returnToLiveEdge() {
-        guard connectionPhase == .ready, pointerWebSocket != nil else {
-            statusMessage = "Connect to the TV before returning to live."
-            return
-        }
-
-        if isMacroRunning {
-            cancelActiveMacro()
-            statusMessage = "Stopped skip macro."
-            return
-        }
-
-        guard lastRewindClickCount > 0 else {
-            statusMessage = "No rewind to undo — wait for a commercial rewind first."
-            return
-        }
-
-        Task { await executeGoLiveMacro() }
-    }
-
-    /// Waits for an in-flight rewind macro, then returns to live with the stored click count.
-    func returnToLiveEdgeWhenReady() async {
-        while isMacroRunning || isExecutingMacro {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-        }
-        await executeGoLiveMacro()
-    }
-
-    func cancelActiveMacro() {
-        macroSequenceTask?.cancel()
-        macroSequenceTask = nil
-        pendingHighlightBanner = nil
-        isMacroRunning = false
-        isExecutingMacro = false
-    }
-
-    // MARK: 5b — THE "JUMP TO LIVE" RESET MACRO
-
-    /// Returns to the live edge — re-opens the scrub bar, then RIGHT-clicks forward.
-    /// Pass `forwardClicks` when the caller computed catch-up.
-    /// `skipOpeningLeft`: highlight return uses Click only — LEFT would undo a skip of watch credit.
-    /// `uninterruptible`: finish every RIGHT even if the Task was cancelled.
-    func executeGoLiveMacro(
-        forwardClicks overrideClicks: Int? = nil,
-        uninterruptible: Bool = false,
-        skipOpeningLeft: Bool = false
-    ) async {
-        guard connectionPhase == .ready else {
-            statusMessage = "Connect to the TV before jumping to live."
-            print("🛑 executeGoLiveMacro aborted — not connected")
-            return
-        }
-
-        cancelActiveMacro()
-        isExecutingMacro = false
-
-        let clicks: Int
-        if let override = overrideClicks {
-            clicks = max(0, override)
-        } else {
-            // Highlight return always passes an override. Bare fallback = exact undo, no +drift/+2.
-            clicks = max(1, lastRewindClickCount)
-        }
-
-        guard clicks > 0 else {
-            statusMessage = "Nothing to undo — already at the target position."
-            print("🛑 executeGoLiveMacro aborted — 0 clicks")
-            return
-        }
-
-        var socketOK = await refreshPointerInputSocket()
-        if !socketOK {
-            try? await Task.sleep(for: .milliseconds(400))
-            socketOK = await refreshPointerInputSocket()
-        }
-        guard socketOK else {
-            statusMessage = "TV input channel lost — tap Reset and reconnect."
-            print("🛑 executeGoLiveMacro aborted — pointer socket lost")
-            return
-        }
-
-        isMacroRunning = true
-        isReturningToLive = true
-        statusMessage = "Returning (\(clicks)× forward)…"
-        print(
-            "⏩ executeGoLiveMacro START — \(clicks)× RIGHT "
-            + "(uninterruptible=\(uninterruptible), skipLeft=\(skipOpeningLeft))"
-        )
-
-        defer {
-            isMacroRunning = false
-            isReturningToLive = false
-        }
-
-        // Re-open scrubber. Highlight auto-return: Click only (no LEFT) so
-        // `rewindClicks − floor(watch/15)` lands correctly.
-        sendPointerClick()
-        try? await Task.sleep(for: .milliseconds(450))
-        if !skipOpeningLeft {
-            sendPointerButton("LEFT")
-            try? await Task.sleep(for: .milliseconds(550))
-        } else {
-            try? await Task.sleep(for: .milliseconds(300))
-        }
-
-        let spacingMs = resolvedClickSpacingMs()
-        var sent = 0
-        for index in 0..<clicks {
-            if !uninterruptible {
-                guard !Task.isCancelled, connectionPhase == .ready else {
-                    print("🛑 executeGoLiveMacro cancelled after \(sent)/\(clicks) RIGHT")
-                    return
-                }
-            } else if connectionPhase != .ready {
-                print("🛑 executeGoLiveMacro lost connection after \(sent)/\(clicks) RIGHT")
-                return
-            }
-            sendPointerButton("RIGHT")
-            sent += 1
-            if index < clicks - 1 {
-                var pauseMs = spacingMs
-                if (index + 1) % resolvedSkipBurstSize() == 0 {
-                    pauseMs += resolvedSkipBurstBreatherMs()
-                }
-                try? await Task.sleep(for: .milliseconds(pauseMs))
-            }
-        }
-
-        try? await Task.sleep(for: .milliseconds(400))
-        sendPointerButton("ENTER")
-
-        lastRewindClickCount = 0
-        lastRewindMacroFinishedAt = nil
-        isExecutingMacro = false
-        statusMessage = "Returned — \(sent)× forward, confirmed."
-        print("⏩ executeGoLiveMacro DONE — \(sent)× RIGHT sent")
-    }
-
-    /// Waits until skip keys finish sending. Does NOT wait on the post-rewind cooldown lock
-    /// (`isExecutingMacro`) — that was blocking highlight return for 4s and racing the hold FSM.
-    func waitForMacroKeysToFinish() async {
-        while isMacroRunning {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-        }
-    }
-
-    /// Waits for an in-flight macro and a short post-skip settle window.
-    func waitForMacroCycleToFinish() async {
-        await waitForMacroKeysToFinish()
-        try? await Task.sleep(nanoseconds: 1_500_000_000)
-    }
-
-    /// Drops the post-rewind lock so Go Live can run immediately after a highlight watch.
-    func unlockMacroForReturn() {
-        isExecutingMacro = false
-    }
-
-    /// Highlight auto-return — same Click→skip→ENTER path as rewind, direction RIGHT.
-    func executeHighlightReturnMacro(forwardClicks: Int) async {
+    /// Forwards after a highlight (or manual Go Live) — same Click→skips→ENTER path as rewind.
+    /// Caller passes the exact RIGHT count (rewind depth minus watched time).
+    func runForwardMacro(forwardClicks: Int) async {
         let clicks = max(1, forwardClicks)
         guard connectionPhase == .ready else {
             statusMessage = "Connect to the TV before returning."
-            print("🛑 executeHighlightReturnMacro aborted — not connected")
+            print("🛑 runForwardMacro aborted — not connected")
             return
         }
 
-        unlockMacroForReturn()
+        isExecutingMacro = false
 
-        // Soft refresh only — do NOT tear down a healthy pointer socket mid-session.
         var socketOK = await refreshPointerInputSocket()
         if !socketOK {
             try? await Task.sleep(for: .milliseconds(400))
@@ -920,14 +761,14 @@ final class TVController: ObservableObject {
         }
         guard socketOK else {
             statusMessage = "TV input channel lost — tap Reset and reconnect."
-            print("🛑 executeHighlightReturnMacro aborted — pointer socket lost")
+            print("🛑 runForwardMacro aborted — pointer socket lost")
             return
         }
 
         isExecutingMacro = true
         isReturningToLive = true
         let spc = secondsPerSkipClick()
-        print("⏩ executeHighlightReturnMacro START — \(clicks)× RIGHT via rewind macro path")
+        print("⏩ runForwardMacro START — \(clicks)× RIGHT")
 
         runPointerMacro(
             direction: "RIGHT",
@@ -943,7 +784,49 @@ final class TVController: ObservableObject {
         isExecutingMacro = false
         lastRewindClickCount = 0
         lastRewindMacroFinishedAt = nil
-        print("⏩ executeHighlightReturnMacro DONE — waited for \(clicks)× RIGHT")
+        print("⏩ runForwardMacro DONE — \(clicks)× RIGHT")
+    }
+
+    /// Manual Go Live with no watch credit — undo the last rewind click-for-click.
+    func returnToLiveEdge() {
+        guard connectionPhase == .ready, pointerWebSocket != nil else {
+            statusMessage = "Connect to the TV before returning."
+            return
+        }
+        if isMacroRunning {
+            cancelActiveMacro()
+            statusMessage = "Stopped skip macro."
+            return
+        }
+        let clicks = max(1, lastRewindClickCount)
+        Task { await runForwardMacro(forwardClicks: clicks) }
+    }
+
+    func returnToLiveEdgeWhenReady() async {
+        while isMacroRunning || isExecutingMacro {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        await runForwardMacro(forwardClicks: max(1, lastRewindClickCount))
+    }
+
+    func cancelActiveMacro() {
+        macroSequenceTask?.cancel()
+        macroSequenceTask = nil
+        pendingHighlightBanner = nil
+        isMacroRunning = false
+        isExecutingMacro = false
+    }
+
+    /// Waits until skip keys finish sending (not the post-rewind cooldown lock).
+    func waitForMacroKeysToFinish() async {
+        while isMacroRunning {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+
+    func waitForMacroCycleToFinish() async {
+        await waitForMacroKeysToFinish()
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
     }
 
     /// Skips forward on the DVR scrub bar — decrements the live-edge ledger per click.

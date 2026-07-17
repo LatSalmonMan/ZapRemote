@@ -2065,7 +2065,7 @@ final class SportsAPIService: ObservableObject {
         let statusLabel = status?.type.description ?? status?.type.name ?? latestPlay?.text ?? "Unknown"
 
         // Highlight / auto-return in progress — ESPN polling must NOT interrupt.
-        // Auto Go Live after a highlight is owned only by `forceReturnAfterHighlight` at watch end.
+        // Auto return after a highlight is owned by `returnAfterHighlightWatch` at watch end.
         // (A race here used to wipe the ledger mid-watch and make return no-op.)
         if isCommercialBreakLoopActive
             || breakSession.isBreakActive
@@ -2416,18 +2416,19 @@ final class SportsAPIService: ObservableObject {
         )
         breakSession.recordHeldSeconds(highlightSeconds)
 
-        await forceReturnAfterHighlight(
+        await returnAfterHighlightWatch(
             tvController: tvController,
             rewindClicks: rewindClicksDone,
-            highlightSeconds: highlightSeconds
+            watchedSeconds: highlightSeconds
         )
     }
 
-    /// Auto return once. Math: floor((rewindSec − watched − seekPlaythrough) / spc).
-    private func forceReturnAfterHighlight(
+    /// Scrub forward by the remaining gap after the highlight played.
+    /// `forward = floor((rewindClicks×spc − watched) / spc)`, at least 1.
+    private func returnAfterHighlightWatch(
         tvController: TVController,
         rewindClicks: Int,
-        highlightSeconds: Double
+        watchedSeconds: Double
     ) async {
         guard !isAutoReturnInFlight else {
             print("⏩ SportsAPIService: return already in flight — ignoring duplicate")
@@ -2437,24 +2438,10 @@ final class SportsAPIService: ObservableObject {
         defer { isAutoReturnInFlight = false }
 
         let spc = max(1, tvController.secondsPerSkipClick())
-        let spacingMs = StreamingAppSkipProfile.profile(
-            for: tvController.currentAppID.isEmpty
-                ? tvController.preferredStreamingAppID
-                : tvController.currentAppID
-        ).clickSpacingMs
-        let seekPlaythrough = HighlightReturnMath.estimatedSeekPlaythroughSeconds(
-            clicks: rewindClicks,
-            spacingMs: spacingMs
-        )
         let forwardClicks = HighlightReturnMath.forwardClicks(
             rewindClicks: rewindClicks,
-            highlightSeconds: highlightSeconds,
-            secondsPerClick: spc,
-            rewindSeekPlaythroughSeconds: seekPlaythrough
-        )
-        let remainingSeconds = max(
-            0,
-            Int(floor(Double(rewindClicks * spc) - highlightSeconds - seekPlaythrough))
+            watchedSeconds: watchedSeconds,
+            secondsPerClick: spc
         )
 
         _ = breakSession.beginReturn(forwardClicks: forwardClicks)
@@ -2462,21 +2449,21 @@ final class SportsAPIService: ObservableObject {
         await tvController.endHighlightReelBanner()
 
         let line =
-            "Return — \(rewindClicks)×\(spc)s − \(Int(highlightSeconds))s watch − \(Int(seekPlaythrough))s seek "
-            + "→ \(remainingSeconds)s → \(forwardClicks)× RIGHT"
+            "Return — \(rewindClicks)×\(spc)s rewind − \(Int(watchedSeconds))s watched "
+            + "→ \(forwardClicks)× RIGHT"
         print("⏩ SportsAPIService: \(line)")
         appendActivity(line)
         lastStatusSummary = "Returning (\(forwardClicks)× forward)…"
         tvController.statusMessage = "Returning (\(forwardClicks)× forward)…"
 
-        await tvController.executeHighlightReturnMacro(forwardClicks: forwardClicks)
+        await tvController.runForwardMacro(forwardClicks: forwardClicks)
 
         clearBreakPlaybackState()
         highlightHoldStartedAt = nil
         _ = breakSession.beginCooldown()
         finishReliableSkip(
             success: true,
-            message: "Back — \(forwardClicks)× RIGHT after \(Int(highlightSeconds))s watch"
+            message: "Back — \(forwardClicks)× RIGHT after \(Int(watchedSeconds))s watch"
         )
         try? await Task.sleep(nanoseconds: UInt64(BreakSessionMachine.cooldownSeconds * 1_000_000_000))
         if breakSession.phase == .cooldown {
@@ -2486,13 +2473,13 @@ final class SportsAPIService: ObservableObject {
 
     private func returnToLiveAfterReliableSkip(tvController: TVController) async {
         let rewindClicks = max(breakSession.ledger.rewindClicks, tvController.lastRewindClickCount, 1)
-        let highlightSeconds = breakSession.ledger.watchSeconds > 0
-            ? breakSession.ledger.watchSeconds
-            : breakSession.ledger.actualHeldSeconds
-        await forceReturnAfterHighlight(
+        let watched = breakSession.ledger.actualHeldSeconds > 0
+            ? breakSession.ledger.actualHeldSeconds
+            : breakSession.ledger.watchSeconds
+        await returnAfterHighlightWatch(
             tvController: tvController,
             rewindClicks: rewindClicks,
-            highlightSeconds: highlightSeconds
+            watchedSeconds: watched
         )
     }
 
@@ -2572,7 +2559,7 @@ final class SportsAPIService: ObservableObject {
         behindPositionUpdatedAt = Date()
     }
 
-    /// Same math as `forceReturnAfterHighlight` — for manual / abort Go Live.
+    /// Same math as auto-return — for manual / abort Go Live.
     private func calculatedGoLiveForwardClicks() -> Int {
         guard let tvController else { return 1 }
         let spc = max(1, tvController.secondsPerSkipClick())
@@ -2581,7 +2568,7 @@ final class SportsAPIService: ObservableObject {
             if sent > 0 { return sent }
             return max(1, breakSession.ledger.rewindClicks)
         }()
-        let highlightSeconds: Double = {
+        let watched: Double = {
             if let started = highlightHoldStartedAt {
                 return max(0, Date().timeIntervalSince(started))
             }
@@ -2590,20 +2577,10 @@ final class SportsAPIService: ObservableObject {
             }
             return max(0, breakSession.ledger.watchSeconds)
         }()
-        let spacingMs = StreamingAppSkipProfile.profile(
-            for: tvController.currentAppID.isEmpty
-                ? tvController.preferredStreamingAppID
-                : tvController.currentAppID
-        ).clickSpacingMs
-        let seekPlaythrough = HighlightReturnMath.estimatedSeekPlaythroughSeconds(
-            clicks: ledgerClicks,
-            spacingMs: spacingMs
-        )
         return HighlightReturnMath.forwardClicks(
             rewindClicks: ledgerClicks,
-            highlightSeconds: highlightSeconds,
-            secondsPerClick: spc,
-            rewindSeekPlaythroughSeconds: seekPlaythrough
+            watchedSeconds: watched,
+            secondsPerClick: spc
         )
     }
 
@@ -2645,13 +2622,14 @@ final class SportsAPIService: ObservableObject {
         lastBreakPlayID = nil
 
         let rewindClicks = max(breakSession.ledger.rewindClicks, tvController.lastRewindClickCount, 1)
-        let highlightSeconds = breakSession.ledger.watchSeconds > 0
-            ? breakSession.ledger.watchSeconds
-            : (highlightHoldStartedAt.map { Date().timeIntervalSince($0) } ?? breakSession.ledger.actualHeldSeconds)
-        await forceReturnAfterHighlight(
+        let watched = highlightHoldStartedAt.map { Date().timeIntervalSince($0) }
+            ?? (breakSession.ledger.actualHeldSeconds > 0
+                ? breakSession.ledger.actualHeldSeconds
+                : breakSession.ledger.watchSeconds)
+        await returnAfterHighlightWatch(
             tvController: tvController,
             rewindClicks: rewindClicks,
-            highlightSeconds: highlightSeconds
+            watchedSeconds: watched
         )
     }
 
@@ -2663,9 +2641,9 @@ final class SportsAPIService: ObservableObject {
         }
 
         let clicks = calculatedGoLiveForwardClicks()
-        lastStatusSummary = "\(reason) — returning to live (\(clicks)× forward)"
-        appendActivity("\(reason) → Go Live (\(clicks)× RIGHT)")
-        await tvController.executeHighlightReturnMacro(forwardClicks: clicks)
+        lastStatusSummary = "\(reason) — returning (\(clicks)× forward)"
+        appendActivity("\(reason) → \(clicks)× RIGHT")
+        await tvController.runForwardMacro(forwardClicks: clicks)
         clearBreakPlaybackState()
     }
 
@@ -2986,7 +2964,7 @@ final class SportsAPIService: ObservableObject {
         appendActivity(
             "Manual Go Live — \(clicks)× RIGHT (−\(Int(max(0, watched)))s watch)"
         )
-        await tvController.executeHighlightReturnMacro(forwardClicks: clicks)
+        await tvController.runForwardMacro(forwardClicks: clicks)
         resumeReplayMatchClockAfterHighlightSession()
     }
 
